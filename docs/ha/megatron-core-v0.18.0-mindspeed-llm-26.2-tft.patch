@@ -1,0 +1,2084 @@
+diff --git a/megatron/core/optimizer/distrib_optimizer.py b/megatron/core/optimizer/distrib_optimizer.py
+index b388161a6..3d51e45b1 100644
+--- a/megatron/core/optimizer/distrib_optimizer.py
++++ b/megatron/core/optimizer/distrib_optimizer.py
+@@ -2297,6 +2297,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
+                             ]
+
+                 for model_param, tensors in recv_tensors.items():
++                    # The legacy file stores Adam's scalar step in optimizer metadata.
++                    if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
++                        step = self._get_main_param_and_optimizer_states(model_param).get("step")
++                        if step is not None:
++                            tensors["step"] = step
+                     self._set_main_param_and_optimizer_states(model_param, tensors)
+
+     @torch.no_grad()
+diff --git a/megatron/training/high_availability/__init__.py b/megatron/training/high_availability/__init__.py
+new file mode 100644
+index 000000000..b4688390c
+--- /dev/null
++++ b/megatron/training/high_availability/__init__.py
+@@ -0,0 +1,85 @@
++"""Optional MindIO TFT integration for native Megatron training."""
++
++from contextlib import nullcontext
++
++from .high_availability_helper import get_env_args
++
++_started = False
++_training = None
++
++
++def start(args):
++    """Start TFT after binding the local device and before creating the world."""
++    global _started
++    if not get_env_args(args).enable_high_availability:
++        return
++    from .initialize_patch import initialize_distributed
++
++    initialize_distributed(args)
++    _started = True
++
++
++def enabled():
++    return _started
++
++
++def bootstrapping():
++    if not _started:
++        return False
++    from .tft_arf_group_repair import tft_is_arf_reboot_node
++
++    return tft_is_arf_reboot_node()
++
++
++def model_setup(recovery):
++    if not bootstrapping():
++        return nullcontext()
++    from .communication_patch import replacement_model_setup
++
++    return replacement_model_setup(recovery)
++
++
++def run(train, model, optimizer, scheduler, config, checkpointing, build_iterators, iterators, recovery):
++    """Register the official callbacks and run the native trainer."""
++    global _training
++    from .tft_train_initialize import TrainingState, tft_train
++
++    _training = TrainingState(model, optimizer, scheduler, config, checkpointing, build_iterators, iterators, recovery)
++    try:
++        result = tft_train(train, _training)
++        return result, _training.iterators
++    finally:
++        _training = None
++
++
++def begin(step):
++    if _training is not None:
++        _training.begin(step)
++
++
++def commit(step, flops):
++    if _training is not None:
++        _training.commit(step, flops)
++
++
++def backend(default):
++    return 'hccl' if enabled() else default
++
++
++def allow_approximate_sampler_position():
++    return _training is None or not _training.restoring
++
++
++def configure_loader_rng(train_loader, valid_loaders, test_loader):
++    if enabled():
++        from .dataloader_patch import configure_loader_rng as configure
++
++        configure(train_loader, valid_loaders, test_loader)
++
++
++def record_log(losses, grad_norm, num_zeros):
++    if _training is not None:
++        loss = losses.get('lm loss')
++        if loss is not None:
++            loss = loss.item() if hasattr(loss, 'item') else float(loss)
++        _training.log_args = loss, grad_norm, num_zeros
+diff --git a/megatron/training/high_availability/communication_patch.py b/megatron/training/high_availability/communication_patch.py
+new file mode 100644
+index 000000000..6e544bebd
+--- /dev/null
++++ b/megatron/training/high_availability/communication_patch.py
+@@ -0,0 +1,143 @@
++# Adapted from mindspeed_llm/tasks/high_availability/communication_patch.py at effa8e78.
++"""Keep replacement startup local and retain native group creation arguments."""
++
++import os
++import sys
++from contextlib import contextmanager
++from dataclasses import dataclass
++
++import torch.distributed as dist
++
++_original_new_group = None
++_original_barrier_setting = None
++inventory = []
++
++
++@dataclass(eq=False)
++class DeferredGloo:
++    ranks: tuple
++    local_rank: int
++
++    def size(self):
++        return len(self.ranks)
++
++    def rank(self):
++        return self.ranks.index(self.local_rank)
++
++
++@dataclass
++class Group:
++    ranks: tuple
++    backend: str
++    purpose: str
++    kwargs: dict
++    handle: object
++
++
++def install_new_group_wrapper():
++    """Record ordered membership, including Gloo groups deferred on the replacement."""
++    from .tft_arf_group_repair import tft_is_arf_reboot_node
++
++    global _original_new_group, _original_barrier_setting
++    _original_new_group = dist.new_group
++    _original_barrier_setting = os.environ.get('TORCH_DIST_INIT_BARRIER')
++    if tft_is_arf_reboot_node():
++        os.environ['TORCH_DIST_INIT_BARRIER'] = '0'
++    dist.new_group = new_group_wrapper
++
++
++def new_group_wrapper(
++    ranks=None, timeout=None, backend=None, pg_options=None, use_local_synchronization=False, group_desc=None
++):
++    from .tft_arf_group_repair import tft_is_arf_reboot_node
++
++    members = tuple(range(dist.get_world_size()) if ranks is None else sorted(ranks))
++    actual_backend = backend or dist.get_backend()
++    if actual_backend not in ('hccl', 'gloo'):
++        raise ValueError(f"ARF cannot reconnect native backend {actual_backend}")
++    kwargs = dict(
++        ranks=list(members),
++        timeout=timeout,
++        backend=backend,
++        pg_options=pg_options,
++        use_local_synchronization=actual_backend == 'hccl',
++        group_desc=group_desc,
++    )
++    if tft_is_arf_reboot_node() and actual_backend == 'gloo':
++        rank = dist.get_rank()
++        handle = DeferredGloo(members, rank) if rank in members else dist.GroupMember.NON_GROUP_MEMBER
++    else:
++        handle = _original_new_group(**kwargs)
++    inventory.append(Group(members, actual_backend, group_desc or '', kwargs, handle))
++    return handle
++
++
++def seal_group_inventory():
++    """Stop capturing group creation before TFT starts invoking repair callbacks."""
++    if _original_new_group is None:
++        return
++    dist.new_group = _original_new_group
++    if _original_barrier_setting is None:
++        os.environ.pop('TORCH_DIST_INIT_BARRIER', None)
++    else:
++        os.environ['TORCH_DIST_INIT_BARRIER'] = _original_barrier_setting
++
++
++@contextmanager
++def replacement_model_setup(recovery):
++    """Permit only startup actions with a known original-rank result."""
++    from megatron.core import mpu
++
++    original_gather = dist.all_gather_object
++    original_reduce = dist.all_reduce
++    exchange = 0
++
++    def gather(output, value, group=None):
++        nonlocal exchange
++        caller = sys._getframe(1).f_globals.get('__name__')
++        if caller != 'megatron.core.optimizer' or group is not None or recovery is None:
++            raise ValueError("ARF needs the original optimizer parameter-group key exchange")
++        rank = dist.get_rank()
++        rows = recovery.optimizer_group_keys(rank, exchange)
++        if rows is None or len(rows) != len(output) or rows[rank] != value:
++            raise ValueError("ARF optimizer parameter-group keys differ from original startup")
++        output[:] = rows
++        exchange += 1
++
++    def reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
++        caller = sys._getframe(1).f_globals.get('__name__')
++        if (
++            caller != 'megatron.core.models.common.language_module.language_module'
++            or group is None
++            or group is not mpu.get_embedding_group(check_initialized=False)
++            or op != dist.ReduceOp.SUM
++            or async_op
++        ):
++            raise ValueError(f"ARF cannot defer startup reduction from {caller}")
++        # Both tied-weight copies are restored from native DistOpt before training.
++
++    def reject(name):
++        def unexpected(*args, **kwargs):
++            raise ValueError(f"ARF startup collective {name} needs a customer-provided result")
++
++        return unexpected
++
++    guarded = {}
++    dist.all_gather_object, dist.all_reduce = gather, reduce
++    try:
++        for name in (
++            'barrier',
++            'broadcast',
++            'broadcast_object_list',
++            'all_gather',
++            'all_gather_into_tensor',
++            'reduce_scatter_tensor',
++            'all_to_all_single',
++        ):
++            guarded[name] = getattr(dist, name)
++            setattr(dist, name, reject(name))
++        yield
++    finally:
++        dist.all_gather_object, dist.all_reduce = original_gather, original_reduce
++        for name, function in guarded.items():
++            setattr(dist, name, function)
+diff --git a/megatron/training/high_availability/dataloader_patch.py b/megatron/training/high_availability/dataloader_patch.py
+new file mode 100644
+index 000000000..5d4fde06d
+--- /dev/null
++++ b/megatron/training/high_availability/dataloader_patch.py
+@@ -0,0 +1,22 @@
++# Adapted from mindspeed_llm/tasks/high_availability/dataloader_patch.py at effa8e78.
++"""Rebuild the native iterator at the restored sample cursor."""
++
++
++def build_dataset(training):
++    """Recreate train and validation iterators using Megatron's builder."""
++    training.restoring = True
++    try:
++        training.iterators = training.build_iterators()
++    finally:
++        training.restoring = False
++
++
++def configure_loader_rng(train_loader, valid_loaders, test_loader):
++    """Keep native iterator construction from advancing the restored training RNG."""
++    import torch
++
++    from megatron.training import get_args
++
++    for index, loader in enumerate((train_loader, *(valid_loaders or ()), test_loader)):
++        if loader is not None:
++            loader.generator = torch.Generator().manual_seed(get_args().seed + index)
+diff --git a/megatron/training/high_availability/high_availability_helper.py b/megatron/training/high_availability/high_availability_helper.py
+new file mode 100644
+index 000000000..ed0b4c46a
+--- /dev/null
++++ b/megatron/training/high_availability/high_availability_helper.py
+@@ -0,0 +1,11 @@
++# Adapted from mindspeed_llm/tasks/high_availability/high_availability_helper.py at effa8e78.
++import os
++
++
++def get_env_args(args):
++    """Read the official comma-separated TFT deployment switches."""
++    strategies = {item.lower() for item in os.getenv('HIGH_AVAILABILITY', '').split(',')}
++    args.enable_high_availability = bool(strategies & {'dump', 'recover', 'retry'})
++    args.enable_worker_reboot = 'recover' in strategies
++    args.enable_hbmfault_repair = 'retry' in strategies
++    return args
+diff --git a/megatron/training/high_availability/initialize_patch.py b/megatron/training/high_availability/initialize_patch.py
+new file mode 100644
+index 000000000..a6f9c2124
+--- /dev/null
++++ b/megatron/training/high_availability/initialize_patch.py
+@@ -0,0 +1,95 @@
++# Adapted from mindspeed_llm/tasks/high_availability/initialize_patch.py at effa8e78.
++"""TFT startup and checks for the native Partial DistOpt entry point."""
++
++import os
++from importlib.metadata import distribution
++from pathlib import Path
++
++import torch.distributed as dist
++
++
++def initialize_distributed(args):
++    """Perform the official initialize_distributed_wrapper prelude."""
++    if dist.is_initialized():
++        raise RuntimeError("TFT must start before the job creates its distributed world")
++    if not args.use_distributed_optimizer or args.num_distributed_optimizer_instances < 2:
++        raise ValueError("TFT requires native distributed optimizer instances")
++    if not args.bf16 or args.optimizer != 'adam':
++        raise ValueError("TFT port supports native BF16 Adam")
++    if args.distributed_backend not in ('nccl', 'hccl') or args.dataloader_type not in ('single', 'cyclic'):
++        raise ValueError("TFT requires Ascend HCCL and a native sampler")
++    if args.skip_train or args.rerun_mode != 'disabled' or args.num_workers != 0:
++        raise ValueError("TFT requires training, --rerun-mode disabled and --num-workers 0")
++    if not args.save or not args.use_gloo_process_groups:
++        raise ValueError("TFT requires --save and Megatron Gloo groups")
++    excluded = (
++        'use_megatron_fsdp',
++        'use_torch_fsdp2',
++        'use_custom_fsdp',
++        'use_layer_wise_distributed_optimizer',
++        'use_precision_aware_optimizer',
++        'loss_scale',
++        'optimizer_cpu_offload',
++        'fp8',
++        'fp4',
++        'data_parallel_random_init',
++        'perform_rl_step',
++        'vision_pretraining',
++        'lazy_mpu_init',
++        'inprocess_restart',
++        'tp_comm_overlap',
++        'use_sharp',
++        'sharp_enabled_group',
++        'optimizer_cuda_graph',
++        'full_validation',
++        'multiple_validation_sets',
++        'phase_transition_iterations',
++        'fake_process_group',
++        'async_save',
++        'non_persistent_ckpt_type',
++        'force_create_nccl_p2p_group',
++        'no_load_optim',
++        'no_load_rng',
++        'no_save_optim',
++        'no_save_rng',
++        'finetune',
++        'log_progress',
++        'moe_use_upcycling',
++        'ckpt_convert_format',
++        'dump_param_to_param_group_map',
++    )
++    unsupported = [name for name in excluded if getattr(args, name, None)]
++    if unsupported or args.cuda_graph_impl != 'none':
++        raise ValueError(
++            f"TFT native adapter configuration is unsupported: {unsupported}, graph={args.cuda_graph_impl}"
++        )
++    device = int(os.environ.get('LOCAL_RANK', args.local_rank))
++    if device != args.local_rank:
++        raise ValueError("TFT LOCAL_RANK differs from Megatron local_rank")
++    verify_tft_distribution()
++    import torch_npu
++
++    from .communication_patch import install_new_group_wrapper
++    from .tft_train_initialize import tft_init_controller_processor
++
++    torch_npu.npu.set_device(device)
++    if (args.enable_hbmfault_repair or args.enable_worker_reboot) and not callable(
++        getattr(dist, 'reinit_process_group', None)
++    ):
++        raise RuntimeError("TFT recovery requires TorchNPU reinit_process_group")
++    tft_init_controller_processor()
++    if args.enable_worker_reboot:
++        install_new_group_wrapper()
++
++
++def verify_tft_distribution():
++    """Check the official wheel provenance before importing the native SDK."""
++    wheel = distribution('mindio_ttp')
++    version = Path(wheel.locate_file('mindio_ttp/VERSION')).read_text(encoding='utf-8').splitlines()
++    # The release build records the latest commit affecting component/mindio/tft.
++    if wheel.version != '26.2.0' or version != [
++        'mindio_ttp version info:',
++        'mindio_ttp version: 26.2.0',
++        'git: 9a28823c002d113d109c369e4faf8790ddcd8d0a',
++    ]:
++        raise RuntimeError("TFT requires the official MindIO 26.2.0 component build")
+diff --git a/megatron/training/high_availability/native_distopt.py b/megatron/training/high_availability/native_distopt.py
+new file mode 100644
+index 000000000..558fee105
+--- /dev/null
++++ b/megatron/training/high_availability/native_distopt.py
+@@ -0,0 +1,96 @@
++"""Native 0.18.0 shard access for the ported TFT callbacks."""
++
++import math
++
++import torch
++
++from megatron.core.optimizer.optimizer import param_group_identifier_keys
++
++ADAM_KEYS = ('param', 'exp_avg', 'exp_avg_sq')
++
++
++def owned_ranges(leaf, names):
++    for buffer, by_dtype in enumerate(leaf.gbuf_ranges):
++        for dtype, buckets in by_dtype.items():
++            for bucket, ranges in enumerate(buckets):
++                for param, intervals in ranges['param_map'].items():
++                    world = intervals['gbuf_world_in_bucket']
++                    local = intervals['param']
++                    yield param, (names[param], buffer, bucket, dtype, world.start, world.end, local.start, local.end)
++
++
++def _master(leaf, parameter):
++    group, index = leaf.model_param_group_index_map[parameter]
++    return group, leaf.optimizer.param_groups[group]['params'][index]
++
++
++def export_leaf(leaf, names):
++    """Separate native metadata and tensors for the official two-phase peer transfer."""
++    entries, tensors = [], []
++    groups = [{key: value for key, value in group.items() if key != 'params'} for group in leaf.optimizer.param_groups]
++    for parameter, extent in owned_ranges(leaf, names):
++        _, main = _master(leaf, parameter)
++        native = leaf.optimizer.state.get(main, {})
++        values = leaf._get_main_param_and_optimizer_states(parameter)
++        if set(native) - {'exp_avg', 'exp_avg_sq', 'step'}:
++            raise ValueError("TFT supports native Adam state keys")
++        keys = tuple(key for key in ADAM_KEYS if key in values)
++        if keys not in (('param',), ADAM_KEYS):
++            raise ValueError("TFT found incomplete Adam moments")
++        entries.append(
++            (extent, tuple((key, values[key].shape, values[key].dtype) for key in keys), native.get('step'))
++        )
++        tensors.extend(values[key].detach().contiguous() for key in keys)
++    return {'groups': groups, 'entries': entries}, tensors
++
++
++def stage_leaf(leaf, names, metadata):
++    """Check destination shard coordinates before any native state is modified."""
++    groups = metadata['groups']
++    for group, remote in zip(leaf.optimizer.param_groups, groups, strict=True):
++        if 'params' in remote or any(group[key] != remote[key] for key in param_group_identifier_keys):
++            raise ValueError("TFT optimizer group identifiers differ")
++    entries = []
++    for (parameter, current), (extent, specs, step) in zip(
++        owned_ranges(leaf, names), metadata['entries'], strict=True
++    ):
++        if current != extent:
++            raise ValueError("TFT peer has a different native optimizer shard extent")
++        group_index, main = _master(leaf, parameter)
++        keys = tuple(key for key, _, _ in specs)
++        if keys not in (('param',), ADAM_KEYS):
++            raise ValueError("TFT peer supplied invalid Adam state keys")
++        if any(shape != main.shape or dtype != main.dtype for _, shape, dtype in specs):
++            raise ValueError("TFT peer supplied an incompatible native tensor")
++        if step is not None:
++            number = step.item() if isinstance(step, torch.Tensor) and step.ndim == 0 else step
++            if not isinstance(number, (int, float)) or not math.isfinite(number) or number < 0:
++                raise ValueError("TFT peer supplied an invalid Adam step")
++        entries.append((main, specs, step, group_index))
++    return groups, entries
++
++
++@torch.no_grad()
++def apply_leaf(leaf, stage, values):
++    groups, entries = stage
++    native_groups = leaf.optimizer.param_groups
++    for group, remote in zip(native_groups, groups, strict=True):
++        if 'step' not in remote:
++            group.pop('step', None)
++        for key, value in remote.items():
++            if isinstance(value, torch.Tensor) and isinstance(group.get(key), torch.Tensor):
++                group[key].copy_(value)
++            else:
++                group[key] = value
++    stream = iter(values)
++    for main, specs, step, group_index in entries:
++        main.copy_(next(stream))
++        optimizer_state = leaf.optimizer.state[main]
++        optimizer_state.clear()
++        for key, _, _ in specs[1:]:
++            optimizer_state[key] = next(stream).to(main.device)
++        if step is not None:
++            group = native_groups[group_index]
++            if isinstance(step, torch.Tensor) and (group.get('capturable') or group.get('fused')):
++                step = step.to(main.device)
++            optimizer_state['step'] = step
+diff --git a/megatron/training/high_availability/tft_arf_group_repair.py b/megatron/training/high_availability/tft_arf_group_repair.py
+new file mode 100644
+index 000000000..a9e8f89c7
+--- /dev/null
++++ b/megatron/training/high_availability/tft_arf_group_repair.py
+@@ -0,0 +1,133 @@
++# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
++# Modifications Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
++"""Port the official ARF group-rebuild callback to native 0.18.0 group ownership."""
++
++import os
++from logging import getLogger
++
++import torch.distributed as dist
++
++from megatron.core import mpu
++from megatron.training import get_args, get_timers
++
++from .communication_patch import DeferredGloo, inventory
++
++ttp_logger = getLogger(__name__)
++ARF_REBOOT_FLAG = False
++LOAD = None
++PRETRAINED_CHECKPOINT = None
++
++
++def tft_is_arf_reboot_node():
++    return ARF_REBOOT_FLAG
++
++
++def update_arf_reboot_flag(new_state):
++    global ARF_REBOOT_FLAG, LOAD, PRETRAINED_CHECKPOINT
++    args = get_args()
++    if new_state:
++        LOAD = args.load
++        PRETRAINED_CHECKPOINT = args.pretrained_checkpoint
++        args.load = None
++        args.pretrained_checkpoint = None
++    elif ARF_REBOOT_FLAG:
++        args.load = LOAD
++        args.pretrained_checkpoint = PRETRAINED_CHECKPOINT
++    ARF_REBOOT_FLAG = new_state
++
++
++def _phase(record):
++    purpose = record.purpose
++    if purpose.startswith('DATA_PARALLEL_GROUP_WITH_CP'):
++        return 1
++    if purpose.startswith('DATA_PARALLEL_GROUP'):
++        return 0
++    if purpose.startswith('CONTEXT_PARALLEL_GROUP'):
++        return 2
++    if purpose == 'MODEL_PARALLEL_GROUP':
++        return 3
++    if purpose == 'TENSOR_MODEL_PARALLEL_GROUP':
++        return 4
++    if purpose in ('PIPELINE_MODEL_PARALLEL_GROUP', 'EMBEDDING_GROUP', 'POSITION_EMBEDDING_GROUP'):
++        return 5
++    if (
++        'PARTIAL' in purpose
++        or 'OPTIMIZER_INSTANCE' in purpose
++        or purpose.endswith('_L1')
++        or purpose.startswith('HIERARCHICAL_EXPERT_DATA_PARALLEL_GROUP')
++    ):
++        return 7
++    return 6
++
++
++def arf_rebuild_process_group_callback(fault_ranks, training, ctx):
++    """Reconnect world, parallel groups and optimizer groups in the TFT ARF callback."""
++    if not get_args().enable_worker_reboot or not inventory:
++        raise ValueError("TFT ARF has no registered Megatron group inventory")
++    rank = dist.get_rank()
++    if (
++        not fault_ranks
++        or len(set(fault_ranks)) != len(fault_ranks)
++        or any(type(fault) is not int or not 0 <= fault < dist.get_world_size() for fault in fault_ranks)
++        or (rank in fault_ranks) != tft_is_arf_reboot_node()
++    ):
++        raise ValueError("TFT ARF replacement list differs from local processor status")
++
++    timers = get_timers()
++    timers('interval-time', log_level=0).reset()
++    previous = os.environ.get('TORCH_DIST_INIT_BARRIER')
++    os.environ['TORCH_DIST_INIT_BARRIER'] = '1'
++    try:
++        _reconnect(None)
++        replacements, old_groups = {}, []
++        for record in sorted(inventory, key=_phase):
++            if rank not in record.ranks:
++                continue
++            if record.backend == 'hccl':
++                _reconnect(record.handle)
++                if tuple(dist.get_process_group_ranks(record.handle)) != record.ranks:
++                    raise RuntimeError("ARF changed native HCCL shard order")
++                continue
++            old = record.handle
++            record.handle = dist.new_group(**dict(record.kwargs, use_local_synchronization=True))
++            if tuple(dist.get_process_group_ranks(record.handle)) != record.ranks:
++                raise RuntimeError("ARF changed native Gloo shard order")
++            replacements[id(old)] = record.handle
++            if not isinstance(old, DeferredGloo):
++                old_groups.append(old)
++
++        update_model_and_optim_related_group(training, replacements)
++        for group in old_groups:
++            dist.destroy_process_group(group)
++        dist.barrier()
++        update_arf_reboot_flag(False)
++        training.rebuilt = True
++    finally:
++        if previous is None:
++            os.environ.pop('TORCH_DIST_INIT_BARRIER', None)
++        else:
++            os.environ['TORCH_DIST_INIT_BARRIER'] = previous
++    ttp_logger.info("TFT rank %d restored native process groups", rank)
++
++
++def _reconnect(group):
++    world = dist.group.WORLD
++    expected = world if group is None else group
++    result = dist.reinit_process_group(group=group, rebuild_link=True)
++    if dist.group.WORLD is not world or (result is not None and result is not expected):
++        raise RuntimeError("ARF requires TorchNPU in-place HCCL process-group reconnection")
++
++
++def update_model_and_optim_related_group(training, replacements):
++    """Replace Gloo references; native DDP and schedule HCCL handles survive in place."""
++    for name, value in tuple(vars(mpu).items()):
++        if id(value) in replacements:
++            setattr(mpu, name, replacements[id(value)])
++    mpu._global_process_group_list[:] = [
++        replacements.get(id(group), group) for group in mpu._global_process_group_list
++    ]
++    for _, _, leaves in training.domains:
++        for _, leaf in leaves:
++            old = leaf.data_parallel_group_gloo
++            leaf.data_parallel_group_gloo = replacements.get(id(old), old)
++    training.checkpointing.clear()
+diff --git a/megatron/training/high_availability/tft_dump.py b/megatron/training/high_availability/tft_dump.py
+new file mode 100644
+index 000000000..24171dc03
+--- /dev/null
++++ b/megatron/training/high_availability/tft_dump.py
+@@ -0,0 +1,236 @@
++# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
++# Modifications Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
++"""Port official dump selection, writer and rename to native 0.18.0 legacy files."""
++
++import os
++from argparse import Namespace
++from pathlib import Path
++from tempfile import NamedTemporaryFile
++
++import torch
++import torch.distributed as dist
++
++from megatron.core import mpu
++from megatron.core.utils import unwrap_model
++from megatron.training import get_args
++from megatron.training.checkpointing import (
++    generate_state_dict,
++    get_checkpoint_name,
++    get_checkpoint_tracker_filename,
++    get_distributed_optimizer_checkpoint_name,
++)
++
++from .native_distopt import ADAM_KEYS
++
++
++def _save_root(args):
++    # Keep the legacy dump separate from a periodic torch_dist tracker.
++    return Path(args.save) if args.ckpt_format == 'torch' else Path(str(args.save) + '.tft')
++
++
++def _temporary_directory(step):
++    return _save_root(get_args()) / f'iter_{step:07d}_tmp'
++
++
++def tft_save_callback(step, save_info, training, ctx):
++    """Write the local legacy checkpoint contribution from TFT-selected shard ranks."""
++    training.require_state(step)
++    rank = dist.get_rank()
++    selected = {}
++    for entry in save_info:
++        domain, ranks = entry['type'], tuple(entry['ranks'])
++        if not 0 <= domain < len(training.domains) or domain in selected:
++            raise ValueError("TFT save assignment has an invalid or duplicate optimizer domain")
++        full, width, _ = training.domains[domain]
++        if (
++            rank not in ranks
++            or any(member not in full for member in ranks)
++            or sorted(full.index(member) % width for member in ranks) != list(range(width))
++        ):
++            raise ValueError("TFT save assignment must cover each logical shard exactly once")
++        if full.index(ranks[0]) % width:
++            raise ValueError("TFT save writer is outside the first logical shard")
++        selected[domain] = ranks
++
++    if not selected:
++        raise ValueError("TFT did not assign a local save contribution")
++    # A legacy model_optim_rng file needs all domains for its model coordinate.
++    # Frozen TFT only supplies local assignments, so require a common selection.
++    ranks = next(iter(selected.values()))
++    if (
++        set(selected) != set(range(len(training.domains)))
++        or any(selection != ranks for selection in selected.values())
++        or get_args().expert_model_parallel_size != 1
++    ):
++        raise ValueError("Legacy TFT dump needs a common native-domain writer for each model file")
++
++    writer = ranks[0]
++    group = dist.new_group(list(ranks), backend='gloo', use_local_synchronization=True)
++    try:
++        actual = dist.get_process_group_ranks(group)
++        model = unwrap_model(training.model)
++        weights, packed = {}, {}
++        for domain in sorted(selected):
++            members, width, leaves = training.domains[domain]
++            order = sorted(range(len(actual)), key=lambda index: members.index(actual[index]) % width)
++            shard = members.index(rank) % width
++            for index, leaf in leaves:
++                buffers, parameters = _gather_leaf(leaf, shard, width, order, writer, group)
++                if rank == writer:
++                    packed[index] = buffers
++                    if weights.keys() & parameters.keys():
++                        raise ValueError("Native optimizer leaves supplied overlapping parameters")
++                    weights.update(parameters)
++        if rank == writer:
++            save_checkpoint(step, training, model, packed, weights)
++    finally:
++        dist.destroy_process_group(group)
++
++
++def _gather_leaf(leaf, shard, width, order, writer, group):
++    """Gather and reorder native coalesced legacy buffers, using the TFT global writer."""
++    is_writer = dist.get_rank() == writer
++    packed = {'buckets_coalesced': True}
++    parameters = {}
++    for buffer_index, by_dtype in enumerate(leaf.gbuf_ranges):
++        buffer = leaf.buffers[buffer_index]
++        for dtype, ranges in by_dtype.items():
++            total = buffer.numel_unpadded
++            state = {key: torch.zeros(total, dtype=torch.float32) for key in ADAM_KEYS} if is_writer else None
++            offset = 0
++            for bucket_index, ranges_by_parameter in enumerate(ranges):
++                bucket = buffer.buckets[bucket_index]
++                bucket_size = bucket.grad_data.numel()
++                if bucket_size % width:
++                    raise ValueError("Native bucket cannot be partitioned by the selected shards")
++                size = bucket_size // width
++                valid = bucket.numel_unpadded
++                by_key = {key: torch.zeros(size, dtype=torch.float32) for key in ADAM_KEYS}
++                bucket_parameters = {
++                    param: (start - bucket.offset, end - bucket.offset)
++                    for param, (start, end, owner) in buffer.param_index_map.items()
++                    if owner == bucket_index
++                }
++                shard_start, shard_end = shard * size, (shard + 1) * size
++                expected = {
++                    param: (max(start, shard_start), min(end, shard_end))
++                    for param, (start, end) in bucket_parameters.items()
++                    if max(start, shard_start) < min(end, shard_end)
++                }
++                if expected.keys() != ranges_by_parameter['param_map'].keys():
++                    raise ValueError("TFT dump shard coverage differs from the native bucket")
++                for parameter, location in ranges_by_parameter['param_map'].items():
++                    world = location['gbuf_world_in_bucket']
++                    local = location['gbuf_local']
++                    if not (
++                        0 <= local.start < local.end <= size
++                        and (world.start, world.end) == expected[parameter]
++                        and (world.start, world.end) == (shard_start + local.start, shard_start + local.end)
++                        and world.end <= valid
++                    ):
++                        raise ValueError("Native dump encountered a shard-range mismatch")
++                    tensors = leaf._get_main_param_and_optimizer_states(parameter)
++                    for key, piece in by_key.items():
++                        value = tensors[key]
++                        if value.dtype != torch.float32 or value.numel() != local.end - local.start:
++                            raise ValueError("Native dump encountered incompatible Adam state")
++                        piece[local.start : local.end].copy_(value.detach().view(-1).cpu())
++                for key, piece in by_key.items():
++                    received = [torch.empty_like(piece) for _ in order] if is_writer else None
++                    dist.gather(piece, gather_list=received, dst=writer, group=group)
++                    if is_writer:
++                        state[key][offset : offset + valid].copy_(
++                            torch.cat([received[index] for index in order])[:valid]
++                        )
++                if is_writer:
++                    for parameter, (start, end) in bucket_parameters.items():
++                        if not 0 <= start < end <= valid:
++                            raise ValueError("Native dump encountered a parameter outside its bucket")
++                        parameters[parameter] = (
++                            state['param'][offset + start : offset + end].reshape(parameter.shape).to(parameter.dtype)
++                        )
++                offset += valid
++            if offset != total:
++                raise ValueError("Native dump coalesced layout differs from the reader")
++            if is_writer:
++                state['numel_unpadded'] = total
++                packed.setdefault(buffer_index, {})[dtype] = state
++    return packed, parameters
++
++
++def save_checkpoint(step, training, model, packed, weights):
++    """Emit the native legacy reader's model metadata and chained optimizer file."""
++    args = Namespace(**vars(get_args()))
++    args.ckpt_format, args.use_dist_ckpt = 'torch', False
++    state = generate_state_dict(
++        args,
++        model,
++        training.optimizer,
++        training.scheduler,
++        [training.progress['rng']],
++        iteration=step,
++    )
++    state['num_floating_point_operations_so_far'] = training.progress['flops']
++    for (index, name, attribute), buffer in training.progress['model_buffers'].items():
++        model_state = state['model' if len(model) == 1 else f'model{index}']
++        if not attribute and name in model_state:
++            model_state[name] = buffer
++    for parameter, aliases in training.names.items():
++        if parameter.requires_grad and parameter not in weights:
++            raise ValueError("TFT selected shards do not cover a trainable parameter")
++        if parameter not in weights:
++            continue
++        for index, name in aliases:
++            model_state = state['model' if len(model) == 1 else f'model{index}']
++            if name not in model_state:
++                raise ValueError(f"Native checkpoint lacks parameter {name}")
++            model_state[name] = weights[parameter]
++    name = Path(get_checkpoint_name(str(_save_root(args)), step)).parent.name
++    checkpoint = _temporary_directory(step) / name / 'model_optim_rng.pt'
++    checkpoint.parent.mkdir(parents=True, exist_ok=True)
++    if sorted(packed) != list(range(len(packed))):
++        raise ValueError("TFT could not compose all native optimizer leaves")
++    optimizer = packed[0] if len(packed) == 1 else [packed[i] for i in range(len(packed))]
++    with open(get_distributed_optimizer_checkpoint_name(str(checkpoint)), 'xb') as stream:
++        torch.save(optimizer, stream)
++    with checkpoint.open('xb') as stream:
++        torch.save(state, stream)
++
++
++def tft_rename_callback(step, training):
++    """Publish the completed temporary directory, then replace its legacy tracker."""
++    root = _save_root(get_args())
++    stage = _temporary_directory(step)
++    destination = root / f'iter_{step:07d}'
++    tracker = Path(get_checkpoint_tracker_filename(str(root)))
++    if tracker.exists() and int(tracker.read_text()) >= step:
++        raise ValueError("TFT will not replace a tracker at the same or later step")
++    tp = mpu.get_tensor_model_parallel_world_size()
++    pp = mpu.get_pipeline_model_parallel_world_size()
++    for tensor_rank in range(tp):
++        for pipeline_rank in range(pp):
++            filename = get_checkpoint_name(
++                str(root),
++                step,
++                tensor_rank=tensor_rank,
++                pipeline_rank=pipeline_rank,
++                expert_parallel=False,
++            )
++            model_file = stage / Path(filename).parent.name / 'model_optim_rng.pt'
++            optimizer_file = Path(get_distributed_optimizer_checkpoint_name(str(model_file)))
++            if any(not path.is_file() or path.stat().st_size == 0 for path in (model_file, optimizer_file)):
++                raise ValueError(f"TFT dump lacks complete files for TP {tensor_rank} PP {pipeline_rank}")
++    if destination.exists():
++        raise FileExistsError(f"TFT checkpoint directory already exists: {destination}")
++    stage.rename(destination)
++    temporary = None
++    try:
++        with NamedTemporaryFile(mode='w', dir=root, delete=False) as stream:
++            temporary = Path(stream.name)
++            stream.write(str(step))
++            stream.flush()
++            os.fsync(stream.fileno())
++        os.replace(temporary, tracker)
++    finally:
++        if temporary is not None:
++            temporary.unlink(missing_ok=True)
+diff --git a/megatron/training/high_availability/tft_optimizer_data_repair.py b/megatron/training/high_availability/tft_optimizer_data_repair.py
+new file mode 100644
+index 000000000..2634035ac
+--- /dev/null
++++ b/megatron/training/high_availability/tft_optimizer_data_repair.py
+@@ -0,0 +1,234 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
++"""Port the official TFT UCE/ARF repair dispatch and peer transfer order."""
++
++import io
++from logging import getLogger
++
++import torch
++import torch.distributed as dist
++from mindio_ttp.framework_ttp import RepairType, tft_report_load_ckpt_step
++
++from megatron.training import get_args
++from megatron.training.checkpointing import load_checkpoint
++
++from .native_distopt import apply_leaf, export_leaf, stage_leaf
++from .tft_replica_group import build_repair_group, get_repair_group
++
++ttp_logger = getLogger(__name__)
++
++
++def repair_callback(step, need_rebuild, error_ranks, repair_info, training, ctx):
++    """Execute the TFT-assigned action. The SDK owns donor and fallback decisions."""
++    kind = RepairType(repair_info['repair_type'])
++    rank = dist.get_rank()
++    participants = tuple(repair_info['rank_list'])
++    records = sorted(
++        zip(repair_info['type'], repair_info['src'], repair_info['dst'], strict=True),
++        key=lambda record: (record[1], record[2], record[0]),
++    )
++    if kind == RepairType.RT_UCE_LOWLEVEL and all(src == dst == rank for _, src, dst in records):
++        training.require_state(step)
++        return
++    if (
++        len(set(participants)) != len(participants)
++        or rank not in participants
++        or any(type(member) is not int or not 0 <= member < dist.get_world_size() for member in participants)
++    ):
++        raise ValueError("TFT repair has invalid participants")
++    if not records or len(records) != len(set(records)):
++        raise ValueError("TFT repair supplied missing or duplicate assignments")
++    if kind in (RepairType.RT_LOAD_CKPT, RepairType.RT_LOAD_REBUILD):
++        if (
++            set(participants) != set(range(dist.get_world_size()))
++            or any(src != rank or dst != rank for _, src, dst in records)
++            or {domain for domain, _, _ in records} != set(range(len(training.domains)))
++        ):
++            raise ValueError("The native checkpoint reader requires a whole-world TFT load action")
++        load_ckpt_repair(training)
++        return
++
++    is_sender = kind == RepairType.RT_SEND
++    if not is_sender and kind not in (
++        RepairType.RT_UCE_HIGHLEVEL,
++        RepairType.RT_UCE_LOWLEVEL,
++        RepairType.RT_RECV_REPAIR,
++    ):
++        raise ValueError(f"Unsupported TFT repair action {kind}")
++    for domain, source, destination in records:
++        if not 0 <= domain < len(training.domains) or source == destination:
++            raise ValueError("Invalid TFT repair domain or direction")
++        members, width, _ = training.domains[domain]
++        if (
++            source not in members
++            or destination not in members
++            or source not in participants
++            or destination not in participants
++            or members.index(source) % width != members.index(destination) % width
++            or rank != (source if is_sender else destination)
++        ):
++            raise ValueError("TFT peer assignment does not match a native replica shard")
++
++    build_repair_group(participants)
++    if is_sender:
++        send_rank_repair(step, records, training)
++    else:
++        recv_rank_repair(step, records, training)
++
++
++def send_rank_repair(step, records, training):
++    training.require_state(step)
++    args = get_args()
++    exports = []
++    for domain, _, destination in records:
++        leaves = []
++        tensors = []
++        for index, leaf in training.domains[domain][2]:
++            state, owned = export_leaf(leaf, training.names)
++            leaves.append((index, state))
++            tensors.extend(owned)
++        save_and_send_ckpt(
++            destination,
++            {
++                'step': step,
++                'domain': domain,
++                'leaves': leaves,
++                'scheduler': training.progress['scheduler'],
++                'counters': training.progress['counters'],
++                'flops': training.progress['flops'],
++                'data_flags': (args.do_train, args.do_valid, args.do_test),
++            },
++        )
++        exports.append(tensors)
++
++    for (_, _, destination), tensors in zip(records, exports, strict=True):
++        for tensor in tensors:
++            dist.send(tensor, dst=destination, group=get_repair_group())
++    for _, _, destination in records:
++        send_log_args(destination, training)
++
++
++def recv_rank_repair(step, records, training):
++    domains = {domain for domain, _, _ in records}
++    require_all = training.step != step or training.pending is not None or training.damaged
++    if len(domains) != len(records) or (require_all and domains != set(range(len(training.domains)))):
++        raise ValueError("TFT assignments do not restore all potentially invalid native leaves")
++    progress = training.original_rank_progress(step)
++    grouped = []
++    flags = None
++    for domain, source, _ in records:
++        metadata = recv_ckpt_from_peer(source)
++        if metadata['step'] != step or metadata['domain'] != domain:
++            raise ValueError("TFT peer returned a different step or optimizer domain")
++        if (
++            metadata['scheduler'] != progress['scheduler']
++            or metadata['counters'] != progress['counters']
++            or metadata['flops'] != progress['flops']
++        ):
++            raise ValueError("TFT peer and original rank disagree on completed-step counters")
++        if flags is not None and flags != metadata['data_flags']:
++            raise ValueError("TFT donors disagree on data-iterator flags")
++        flags = metadata['data_flags']
++        stages = []
++        for (index, leaf), (remote_index, state) in zip(training.domains[domain][2], metadata['leaves'], strict=True):
++            if index != remote_index:
++                raise ValueError("TFT peer returned a different optimizer leaf")
++            stages.append((leaf, stage_leaf(leaf, training.names, state)))
++        grouped.append((source, stages))
++
++    updates = []
++    for source, stages in grouped:
++        for leaf, stage in stages:
++            tensors = []
++            for _, specs, _, _ in stage[1]:
++                for _, shape, dtype in specs:
++                    tensor = torch.empty(shape, dtype=dtype, device='npu')
++                    dist.recv(tensor, src=source, group=get_repair_group())
++                    tensors.append(tensor.cpu())
++            updates.append((leaf, stage, tensors))
++    for _, source, _ in records:
++        recv_log_args(source, training)
++
++    training.damaged = True
++    for leaf, stage, tensors in updates:
++        apply_leaf(leaf, stage, tensors)
++    torch.npu.synchronize()
++    args = get_args()
++    args.do_train, args.do_valid, args.do_test = flags
++    training.received = progress
++    training.step, training.pending, training.damaged = step, None, False
++
++
++def save_and_send_ckpt(destination, state_dict):
++    """Send the same size-then-serialized-NPU-tensor metadata frames as 26.2.0."""
++    buffer = io.BytesIO()
++    torch.save(state_dict, buffer)
++    payload = torch.frombuffer(bytearray(buffer.getbuffer()), dtype=torch.uint8).to('npu')
++    size = torch.tensor([payload.numel()], dtype=torch.long, device='npu')
++    dist.send(size, dst=destination, group=get_repair_group())
++    dist.send(payload, dst=destination, group=get_repair_group())
++
++
++def recv_ckpt_from_peer(source):
++    size = torch.empty(1, dtype=torch.long, device='npu')
++    dist.recv(size, src=source, group=get_repair_group())
++    if size.item() <= 0:
++        raise ValueError("TFT peer sent an empty memory checkpoint")
++    payload = torch.empty(size.item(), dtype=torch.uint8, device='npu')
++    dist.recv(payload, src=source, group=get_repair_group())
++    buffer = io.BytesIO(payload.cpu().numpy().tobytes())
++    return torch.load(buffer, map_location='cpu', weights_only=False)
++
++
++def send_log_args(destination, training):
++    """Keep the official LM loss, grad norm and zero-count frame order."""
++    loss, norm, zeros = training.log_args
++    size = torch.tensor([-1 if loss is None else 1], dtype=torch.long)
++    dist.send(size, dst=destination, group=get_repair_group(True))
++    if loss is not None:
++        dist.send(
++            torch.as_tensor(loss, dtype=torch.float32, device='npu').reshape(1),
++            dst=destination,
++            group=get_repair_group(),
++        )
++    for value in (norm, zeros):
++        tensor = torch.tensor([-1 if value is None else value], dtype=torch.float32)
++        dist.send(tensor, dst=destination, group=get_repair_group(True))
++
++
++def recv_log_args(source, training):
++    size = torch.empty(1, dtype=torch.long)
++    dist.recv(size, src=source, group=get_repair_group(True))
++    loss = None
++    if size.item() == 1:
++        loss = torch.empty(1, dtype=torch.float32, device='npu')
++        dist.recv(loss, src=source, group=get_repair_group())
++        loss = loss.item()
++    elif size.item() != -1:
++        raise ValueError("TFT peer log loss frame is invalid")
++    stats = []
++    for _ in range(2):
++        value = torch.empty(1, dtype=torch.float32)
++        dist.recv(value, src=source, group=get_repair_group(True))
++        stats.append(None if value.item() == -1 else value.item())
++    training.repaired_log_args = (loss, *stats)
++
++
++def load_ckpt_repair(training):
++    """Load the native checkpoint only for TFT's two disk actions."""
++    args = get_args()
++    if not args.load:
++        raise ValueError("TFT requested disk recovery without --load")
++    training.damaged = True
++    for field in training.counters:
++        setattr(args, field, 0)
++    training.scheduler.num_steps = 0
++    step, flops = load_checkpoint(
++        training.model, training.optimizer, training.scheduler, checkpointing_context=training.checkpointing
++    )
++    if step <= 0:
++        raise ValueError("TFT requires a positive checkpoint step")
++    torch.npu.synchronize()
++    training.received = training._progress(step, flops)
++    training.step, training.pending, training.damaged = step, None, False
++    training.loaded = True
++    tft_report_load_ckpt_step(step)
+diff --git a/megatron/training/high_availability/tft_replica_group.py b/megatron/training/high_availability/tft_replica_group.py
+new file mode 100644
+index 000000000..fe2829ebe
+--- /dev/null
++++ b/megatron/training/high_availability/tft_replica_group.py
+@@ -0,0 +1,81 @@
++# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
++# Modifications Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
++# Modification description：Modify the compose of processor group DP-CP-EP for MindIo.
++
++from logging import getLogger
++
++import torch
++
++from megatron.core import mpu
++
++ttp_logger = getLogger(__name__)
++
++REPAIR_GROUP = None
++REPAIR_GROUP_GLOO = None
++
++
++def build_repair_group(rank_list: list):
++    global REPAIR_GROUP, REPAIR_GROUP_GLOO
++    REPAIR_GROUP = torch.distributed.new_group(rank_list, use_local_synchronization=True)
++    REPAIR_GROUP_GLOO = torch.distributed.new_group(rank_list, use_local_synchronization=True, backend="gloo")
++    ttp_logger.info(
++        "[repair] rank:%s build repair group, rank list:%s, repair group:%s ",
++        torch.distributed.get_rank(),
++        rank_list,
++        REPAIR_GROUP,
++    )
++
++
++def get_repair_group(use_gloo: bool = False):
++    global REPAIR_GROUP, REPAIR_GROUP_GLOO
++    if use_gloo:
++        return REPAIR_GROUP_GLOO
++    return REPAIR_GROUP
++
++
++def destroy_repair_group():
++    global REPAIR_GROUP, REPAIR_GROUP_GLOO
++    if REPAIR_GROUP:
++        torch.distributed.destroy_process_group(REPAIR_GROUP)
++    REPAIR_GROUP = None
++    if REPAIR_GROUP_GLOO:
++        torch.distributed.destroy_process_group(REPAIR_GROUP_GLOO)
++    REPAIR_GROUP_GLOO = None
++
++
++def optimizer_domains(optimizer, args):
++    """Map official ATTENTION/MOE indices to the actual native optimizer leaves."""
++    dense = mpu.get_data_parallel_group(with_context_parallel=True)
++    dense_intra = mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
++    configs = [(dense, dense_intra)]
++    if args.num_experts is not None:
++        configs.append(
++            (
++                mpu.get_expert_data_parallel_group(),
++                mpu.get_expert_data_parallel_group(partial_expert_data_parallel=True),
++            )
++        )
++    inter = tuple(torch.distributed.get_process_group_ranks(mpu.get_inter_distributed_optimizer_instance_group()))
++    leaves = getattr(optimizer, 'chained_optimizers', [optimizer])
++    result = []
++    rank = torch.distributed.get_rank()
++    instances = args.num_distributed_optimizer_instances
++    for full, intra in configs:
++        members = tuple(torch.distributed.get_process_group_ranks(full))
++        shard_members = tuple(torch.distributed.get_process_group_ranks(intra))
++        width = len(shard_members)
++        instance, shard = divmod(members.index(rank), width)
++        if (
++            members != tuple(sorted(members))
++            or len(members) != width * instances
++            or members[instance * width : (instance + 1) * width] != shard_members
++            or members[shard::width] != inter
++        ):
++            raise RuntimeError("TFT sorted replica table does not match native DistOpt shard order")
++        bound = [(i, leaf) for i, leaf in enumerate(leaves) if getattr(leaf, 'data_parallel_group', None) is intra]
++        result.append((members, width, bound))
++    if sorted(index for _, _, domain_leaves in result for index, _ in domain_leaves) != list(range(len(leaves))):
++        raise RuntimeError("TFT could not bind every native optimizer leaf to a unique domain")
++    if any(leaf.grad_scaler is not None for leaf in leaves):
++        raise RuntimeError("TFT native BF16 repair requires the unity loss scale")
++    return result
+diff --git a/megatron/training/high_availability/tft_rollback.py b/megatron/training/high_availability/tft_rollback.py
+new file mode 100644
+index 000000000..6bdbaee27
+--- /dev/null
++++ b/megatron/training/high_availability/tft_rollback.py
+@@ -0,0 +1,93 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
++"""Port the official rollback order to native DDP and its iterator builder."""
++
++from logging import getLogger
++
++import torch
++import torch.distributed as dist
++
++from megatron.core import mpu
++from megatron.core.num_microbatches_calculator import update_num_microbatches
++from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
++from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
++from megatron.training import get_args, get_timers
++
++from .dataloader_patch import build_dataset
++from .tft_replica_group import destroy_repair_group
++from .tft_tensor_recovery import restore_model_tensors
++
++ttp_logger = getLogger(__name__)
++
++
++@torch.no_grad()
++def rollback_callback(step, training, ctx):
++    from .tft_train_initialize import restore_rng
++
++    args = get_args()
++    if training.loaded:
++        # The controller learns the actual disk step after the rollback callback.
++        step = training.received['step']
++    training.require_state(step)
++    progress = training.received or training.original_rank_progress(step)
++    if progress['step'] != step:
++        raise ValueError("TFT rollback progress differs from the selected step")
++    training.damaged = True
++    for key, value in progress['counters'].items():
++        setattr(args, key, value)
++    args.iteration = args.curr_iteration = step
++    args.num_floating_point_operations_so_far = progress['flops']
++    training.scheduler.num_steps = 0
++    training.scheduler.load_state_dict(progress['scheduler'])
++    update_num_microbatches(args.consumed_train_samples, consistency_check=True)
++
++    feature_rollback()
++    restore_model_tensors(training.model, progress['model_buffers'])
++    gather_model_params_from_optimizer(training, step)
++    build_dataset(training)
++    restore_rng(progress['rng'])
++    dist.barrier()
++    destroy_repair_group()
++    training_log_repair(step, training)
++    rebuild_global_vars(step, training)
++    training.progress = progress
++    training.received = None
++    training.loaded = False
++    training.damaged = False
++
++
++def feature_rollback():
++    mpu.destroy_global_memory_buffer()
++    mpu._set_global_memory_buffer()
++    destroy_moe_metrics_tracker()
++
++
++def gather_model_params_from_optimizer(training, step):
++    training.optimizer.zero_grad(set_to_none=True)
++    for _, _, leaves in training.domains:
++        for _, leaf in leaves:
++            leaf._scale_one.fill_(1)
++            leaf._copy_main_params_to_model_params()
++    for model in training.model:
++        if model.remove_forward_pre_hook_handles:
++            model.disable_forward_pre_hook(param_sync=False)
++        model.zero_grad_buffer()
++        model.start_param_sync(force_sync=True)
++    torch.npu.synchronize()
++    ttp_logger.info("TFT restored native model shards at step %s", step)
++
++
++def training_log_repair(step, training):
++    if training.repaired_log_args is not None:
++        ttp_logger.info("TFT restored training log values at step %s: %s", step, training.repaired_log_args)
++        training.log_args = training.repaired_log_args
++        training.repaired_log_args = None
++
++
++def rebuild_global_vars(step, training):
++    for key, value in training.sync_hooks.items():
++        setattr(training.config, key, value)
++    for timer in get_timers()._timers.values():
++        timer.reset()
++    rerun = get_rerun_state_machine()
++    rerun.current_iteration = step
++    rerun.state = RerunState.NOT_RUNNING_YET
+diff --git a/megatron/training/high_availability/tft_stop_clean.py b/megatron/training/high_availability/tft_stop_clean.py
+new file mode 100644
+index 000000000..c71f1c677
+--- /dev/null
++++ b/megatron/training/high_availability/tft_stop_clean.py
+@@ -0,0 +1,101 @@
++# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
++# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
++
++import time
++from logging import getLogger
++
++import torch
++import torch_npu
++from mindio_ttp.framework_ttp.ttp_decorator import tft_get_repair_type
++
++from .tft_tensor_recovery import model_tensors, update_optimizer_tensors_to_safe
++from .utils import ha_constant
++
++ttp_logger = getLogger(__name__)
++
++
++def stop_callback(training, ctx):
++    # stop and clean device
++    device = torch.npu.current_device()
++    ret = torch_npu.npu.stop_device(device)
++    if ret is not None and ret != ha_constant.RET_OK:
++        raise RuntimeError("stop failed,end stop callback")
++
++
++def clean_callback(is_uce_error: bool, training, ctx):
++    """
++    this function do:
++    1) get UCE check result from torch_npu
++    2) do some clear before rebuild (avoid OOM) when the check result is UCE_HIGH_LEVEL
++    3) HCCL resume and restart device
++    """
++    device = torch.npu.current_device()
++    rank = torch.distributed.get_rank()
++    ret = ha_constant.RET_OK
++    start_time = time.time()
++    unset_gather_handle(training.model)
++    if is_uce_error:
++        check_memory_result = torch_npu.npu.check_uce_in_memory(device)
++        ttp_logger.info(f"rank {rank} check uce memory result: {check_memory_result}")
++        if check_memory_result == ha_constant.UCE_LOW_LEVEL:  # no need rebuild
++            ret = ha_constant.RET_NO_REBUILD
++        elif check_memory_result == ha_constant.UCE_HIGH_LEVEL:  # need rebuild
++            training.damaged = True
++            update_optimizer_tensors_to_safe(training.optimizer)
++            model_update_npu_tensor_to_safe(training.model)
++            ret = ha_constant.RET_OK
++        else:  # exit
++            ret = ha_constant.RET_ERROR
++            ttp_logger.error(f"rank {rank} check uce memory result {ret} is abnormal, exiting...")
++
++    clean_type = tft_get_repair_type()
++    if clean_type == "retry":
++        torch.distributed.reinit_process_group(group=None, rebuild_link=False)
++    torch.npu.restart_device(device)
++
++    ttp_logger.info(f'[clean] rank:{rank}, type:{clean_type}, cost:{time.time() - start_time:.3f}s, ret:{ret}')
++    return ret
++
++
++def model_update_npu_tensor_to_safe(models):
++    from torch_npu.npu._recovery import update_npu_tensor_to_safe as update_tensor_to_safe
++
++    for _, tensor in model_tensors(models):
++        if tensor.device.type == 'npu':
++            update_tensor_to_safe(tensor)
++    for model in models:
++        for buffer in model.buffers:
++            for bucket in buffer.buckets:
++                if bucket.param_data is not None:
++                    update_tensor_to_safe(bucket.param_data)
++                if bucket.grad_data is not None:
++                    update_tensor_to_safe(bucket.grad_data)
++        for buffer in model.expert_parallel_buffers:
++            for bucket in buffer.buckets:
++                if bucket.param_data is not None:
++                    update_tensor_to_safe(bucket.param_data)
++                if bucket.grad_data is not None:
++                    update_tensor_to_safe(bucket.grad_data)
++
++
++def unset_gather_handle(models):
++    for model in models:
++        for bucket_group in model.bucket_groups:
++            bucket_group.grad_reduce_handle = None
++            bucket_group.param_gather_handle = None
++            bucket_group.param_gather_dispatched = False
++            if bucket_group.next_param_gather_bucket_group:
++                bucket_group.next_param_gather_bucket_group.param_gather_handle = None
++
++        for bucket_group in model.expert_parallel_bucket_groups:
++            bucket_group.grad_reduce_handle = None
++            bucket_group.param_gather_handle = None
++            bucket_group.param_gather_dispatched = False
++            if bucket_group.next_param_gather_bucket_group:
++                bucket_group.next_param_gather_bucket_group.param_gather_handle = None
++
++
++def torch_sync():
++    rank = torch.distributed.get_rank()
++    torch.cuda.synchronize()
++    ttp_logger.debug(f"[Pause] rank: {rank} finish synchronize")
+diff --git a/megatron/training/high_availability/tft_tensor_recovery.py b/megatron/training/high_availability/tft_tensor_recovery.py
+new file mode 100644
+index 000000000..d9d1fe9aa
+--- /dev/null
++++ b/megatron/training/high_availability/tft_tensor_recovery.py
+@@ -0,0 +1,67 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
++"""The official optimizer safe-storage traversal adapted to native DistOpt."""
++
++import torch
++
++
++def update_optimizer_tensors_to_safe(optimizer):
++    from torch_npu.npu._recovery import update_npu_tensor_to_safe
++
++    visited = set()
++
++    def update(value):
++        if isinstance(value, torch.Tensor) and value.device.type == 'npu':
++            address = value.untyped_storage().data_ptr()
++            if address not in visited:
++                visited.add(address)
++                update_npu_tensor_to_safe(value)
++
++    for leaf in getattr(optimizer, 'chained_optimizers', [optimizer]):
++        update(leaf._scale_one)
++        for group in leaf.optimizer.param_groups:
++            for parameter in group['params']:
++                update(parameter)
++            for key, value in group.items():
++                if key != 'params':
++                    update(value)
++        for state in leaf.optimizer.state.values():
++            for value in state.values():
++                update(value)
++
++
++def model_tensors(models):
++    """Find registered buffers plus native rotary frequencies held outside state_dict."""
++    from megatron.core.models.common.embeddings.rotary_pos_embedding import (
++        MultimodalRotaryEmbedding,
++        RotaryEmbedding,
++    )
++    from megatron.core.utils import unwrap_model
++
++    for index, model in enumerate(unwrap_model(models)):
++        for name, value in model.named_buffers():
++            yield (index, name, ''), value
++        for name, module in model.named_modules():
++            if isinstance(module, (RotaryEmbedding, MultimodalRotaryEmbedding)):
++                for field in ('inv_freq', 'inv_freq_extra', 'inv_freq_inter'):
++                    value = vars(module).get(field)
++                    if isinstance(value, torch.Tensor):
++                        yield (index, name, field), value
++
++
++def restore_model_tensors(models, values):
++    """Restore the original rank's completed-step persistent tensor values."""
++    from megatron.core.utils import unwrap_model
++
++    tensors = dict(model_tensors(models))
++    if tensors.keys() != values.keys():
++        raise ValueError("TFT saved different native model-buffer ownership")
++    for key, target in tensors.items():
++        source = values[key]
++        if target.shape != source.shape or target.dtype != source.dtype:
++            raise ValueError(f"TFT model buffer layout differs for {key}")
++        target.copy_(source)
++    for model in unwrap_model(models):
++        for module in model.modules():
++            clear = getattr(module.forward, 'cache_clear', None)
++            if clear is not None:
++                clear()
+diff --git a/megatron/training/high_availability/tft_train_initialize.py b/megatron/training/high_availability/tft_train_initialize.py
+new file mode 100644
+index 000000000..02eb54be6
+--- /dev/null
++++ b/megatron/training/high_availability/tft_train_initialize.py
+@@ -0,0 +1,198 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
++"""Port the official TFT bootstrap, callback registration and training wrapper."""
++
++import os
++import random
++from copy import deepcopy
++
++import numpy as np
++import torch
++from mindio_ttp import framework_ttp as tft
++
++from megatron.core import mpu, tensor_parallel
++from megatron.core.utils import unwrap_model
++from megatron.training import get_args
++from megatron.training.checkpointing import get_rng_state
++
++from .tft_arf_group_repair import (
++    arf_rebuild_process_group_callback,
++    tft_is_arf_reboot_node,
++    update_arf_reboot_flag,
++)
++from .tft_dump import tft_rename_callback, tft_save_callback
++from .tft_optimizer_data_repair import repair_callback
++from .tft_replica_group import optimizer_domains
++from .tft_rollback import rollback_callback
++from .tft_stop_clean import clean_callback, stop_callback, torch_sync
++from .tft_tensor_recovery import model_tensors
++
++
++def tft_init_controller_processor():
++    args = get_args()
++    default_ip = '127.0.0.1'
++    ttp_ip = os.getenv('TTP_ADDR', default_ip)
++    controller_ip = os.getenv('CONTROLLER_ADDR', default_ip)
++    if controller_ip == default_ip:
++        controller_ip = ttp_ip
++    processor_ip = os.getenv('PROCESSOR_ADDR', default_ip)
++    if processor_ip == default_ip:
++        processor_ip = ttp_ip
++    port = 8000
++
++    if os.getenv('MINDIO_FOR_MINDSPORE', '').lower() in ('true', '1'):
++        raise RuntimeError("Megatron TFT requires the PyTorch SDK mode")
++    os.environ['TTP_STOP_CLEAN_BEFORE_DUMP'] = '1'
++    start_controller = args.rank == 0 and os.getenv('MINDX_TASK_ID') is None
++    if start_controller:
++        tft.tft_init_controller(args.rank, args.world_size, False, args.enable_worker_reboot, False)
++        tft.tft_start_controller(controller_ip, port, False, '')
++    tft.tft_init_processor(
++        args.rank, args.world_size, False, False, '', args.enable_hbmfault_repair, args.enable_worker_reboot, False
++    )
++    tft.tft_start_processor(processor_ip, port)
++    if tft.tft_is_reboot_node():
++        if not args.enable_worker_reboot or tft.tft_get_reboot_type() != 'arf':
++            raise RuntimeError("TFT reported a replacement outside the ARF deployment mode")
++        update_arf_reboot_flag(True)
++
++
++def tft_register_processor(training):
++    args = get_args()
++    replica_info = [
++        {'rank_list': list(ranks), 'replica_cnt': args.num_distributed_optimizer_instances, 'replica_shift': 0}
++        for ranks, _, _ in training.domains
++    ]
++    tft.tft_set_optimizer_replica(args.rank, replica_info)
++    plain_dp = torch.distributed.get_process_group_ranks(mpu.get_data_parallel_group())
++    tft.tft_set_dp_group_info(args.rank, plain_dp)
++
++    # In generic PyTorch mode the SDK wraps positional arguments in a list.
++    tft.tft_register_save_ckpt_handler(lambda step, info, argv, ctx: tft_save_callback(step, info, argv[0], ctx))
++    tft.tft_register_rename_handler(lambda step, argv: tft_rename_callback(step, argv[0]))
++    tft.tft_register_stop_handler(lambda argv, ctx: stop_callback(argv[0], ctx))
++    tft.tft_register_clean_handler(lambda uce, argv, ctx: clean_callback(uce, argv[0], ctx))
++    tft.tft_register_repair_handler(
++        lambda step, rebuild, errors, info, argv, ctx: repair_callback(step, rebuild, errors, info, argv[0], ctx)
++    )
++    tft.tft_register_rollback_handler(lambda step, argv, ctx: rollback_callback(step, argv[0], ctx))
++    tft.tft_register_rebuild_group_handler(
++        lambda fault_ranks, argv, ctx: arf_rebuild_process_group_callback(fault_ranks, argv[0], ctx)
++    )
++    tft.tft_register_stream_sync_handler(torch_sync)
++
++
++def tft_train(train, training):
++    from .communication_patch import seal_group_inventory
++
++    seal_group_inventory()
++    tft_register_processor(training)
++    first_call = True
++
++    @tft.tft_exception_handler
++    def wrapped(state):
++        nonlocal first_call
++        if first_call:
++            first_call = False
++            if tft_is_arf_reboot_node():
++                tft.tft_report_error(tft.ReportState.RS_INIT_FINISH.value)
++                if tft.tft_wait_next_action() != tft.Action.RETRY.value or not state.rebuilt:
++                    raise ValueError("TFT has not completed ARF communicator recovery")
++                raise RuntimeError("ARF FINISH")
++            state.initialize_step()
++        if state.damaged:
++            raise ValueError("TFT has not restored the paused optimizer")
++        return train(*state.iterators[:2])
++
++    return wrapped(training)
++
++
++class TrainingState:
++    """Hold the position and handles required by the official callback sequence."""
++
++    counters = ('consumed_train_samples', 'skipped_train_samples', 'consumed_valid_samples')
++
++    def __init__(self, model, optimizer, scheduler, config, checkpointing, build_iterators, iterators, recovery):
++        self.model, self.optimizer, self.scheduler = model, optimizer, scheduler
++        self.config, self.checkpointing = config, checkpointing
++        self.build_iterators, self.iterators = build_iterators, iterators
++        self.recovery = recovery
++        self.domains = optimizer_domains(optimizer, get_args())
++        self.names = {}
++        for chunk, module in enumerate(unwrap_model(model)):
++            for name, parameter in module.named_parameters(remove_duplicate=False):
++                self.names.setdefault(parameter, []).append((chunk, name))
++        self.names = {parameter: tuple(names) for parameter, names in self.names.items()}
++        self.sync_hooks = {key: getattr(config, key) for key in ('no_sync_func', 'grad_sync_func', 'param_sync_func')}
++        self.step = None
++        self.pending = None
++        self.progress = None
++        self.received = None
++        self.loaded = False
++        self.damaged = tft_is_arf_reboot_node()
++        self.rebuilt = False
++        self.restoring = False
++        self.log_args = (None, None, None)
++        self.repaired_log_args = None
++
++    def _progress(self, step, flops):
++        args = get_args()
++        return {
++            'step': step,
++            'rank': args.rank,
++            'flops': flops,
++            'counters': {key: getattr(args, key) for key in self.counters},
++            'scheduler': deepcopy(self.scheduler.state_dict()),
++            'rng': deepcopy(get_rng_state('torch', None, None)[0]),
++            'model_buffers': {key: value.detach().to('cpu', copy=True) for key, value in model_tensors(self.model)},
++        }
++
++    def initialize_step(self):
++        args = get_args()
++        self.step = args.iteration
++        self.progress = self._progress(self.step, args.num_floating_point_operations_so_far)
++        if self.step > 0:
++            tft.tft_start_updating_os()
++            tft.tft_end_updating_os(self.step)
++
++    def begin(self, step):
++        if self.pending is not None or self.damaged or step != self.step + 1:
++            raise RuntimeError("TFT optimizer update is outside the completed step boundary")
++        tft.tft_start_updating_os()
++        self.pending = step
++
++    def commit(self, step, flops):
++        if step != self.pending:
++            raise RuntimeError("TFT step does not match the active optimizer transaction")
++        torch_sync()
++        self.progress = self._progress(step, flops)
++        self.step, self.pending = step, None
++        args = get_args()
++        args.iteration = args.curr_iteration = step
++        args.num_floating_point_operations_so_far = flops
++        tft.tft_end_updating_os(step)
++        tft.tft_pause_train(step)
++
++    def require_state(self, step):
++        if step <= 0 or self.step != step or self.pending is not None or self.damaged:
++            raise ValueError(f"TFT action requires valid native state at completed step {step}")
++
++    def original_rank_progress(self, step):
++        if self.progress is not None and self.progress['step'] == step:
++            progress = self.progress
++        elif self.recovery is not None:
++            progress = self.recovery.rank_progress(get_args().rank, step)
++        else:
++            raise ValueError(f"TFT has no original-rank progress at step {step}")
++        if progress is None or (progress['rank'], progress['step']) != (get_args().rank, step):
++            raise ValueError("TFT recovery progress belongs to a different rank or step")
++        if set(progress['counters']) != set(self.counters):
++            raise ValueError("TFT requires the completed step's sample counters")
++        return progress
++
++
++def restore_rng(rng):
++    random.setstate(rng['random_rng_state'])
++    np.random.set_state(rng['np_rng_state'])
++    torch.set_rng_state(rng['torch_rng_state'])
++    torch.cuda.set_rng_state(rng['cuda_rng_state'])
++    tensor_parallel.get_cuda_rng_tracker().set_states(rng['rng_tracker_states'])
+diff --git a/megatron/training/high_availability/utils.py b/megatron/training/high_availability/utils.py
+new file mode 100644
+index 000000000..d8665a6d8
+--- /dev/null
++++ b/megatron/training/high_availability/utils.py
+@@ -0,0 +1,10 @@
++# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
++"""The return codes used by the official TFT device cleanup."""
++
++
++class ha_constant:
++    RET_OK = 0
++    RET_ERROR = 1
++    RET_NO_REBUILD = 2
++    UCE_LOW_LEVEL = 2
++    UCE_HIGH_LEVEL = 3
+diff --git a/megatron/training/initialize.py b/megatron/training/initialize.py
+index ff6555020..6451996aa 100644
+--- a/megatron/training/initialize.py
++++ b/megatron/training/initialize.py
+@@ -26,12 +26,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+     enable_batch_invariant_mode,
+ )
+ from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+-from megatron.training import (
+-    get_adlr_autoresume,
+-    get_args,
+-    get_tensorboard_writer,
+-    inprocess_restart,
+-)
++from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
++from megatron.training import high_availability as tft_ha
++from megatron.training import inprocess_restart
+ from megatron.training.async_utils import init_persistent_async_worker
+ from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
+
+@@ -129,11 +126,9 @@ def initialize_megatron(
+         # Megatron's MPU is the master. Complete initialization right away.
+         finish_mpu_init()
+
+-        # Autoresume.
+-        _init_autoresume()
+-
+-        # Compile dependencies.
+-        _compile_dependencies()
++        if not tft_ha.bootstrapping():
++            _init_autoresume()
++            _compile_dependencies()
+
+         if args.tp_comm_overlap:
+             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
+@@ -246,6 +241,7 @@ def _initialize_tp_communicators():
+ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
+     """Initialize torch.distributed and core model parallel."""
+     args = get_args()
++    tft_ha.start(args)
+
+     device_count = torch.cuda.device_count()
+     if torch.distributed.is_initialized():
+@@ -313,7 +309,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
+
+         # Call the init process
+         init_process_group_kwargs = {
+-            'backend': args.distributed_backend,
++            'backend': tft_ha.backend(args.distributed_backend),
+             'store': store,
+             'world_size': args.world_size,
+             'rank': args.rank,
+@@ -330,7 +326,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
+             init_process_group_kwargs['store'] = store
+
+         torch.distributed.init_process_group(**init_process_group_kwargs)
+-        inprocess_restart.maybe_force_nccl_backend_init(device_id)
++        if not tft_ha.bootstrapping():
++            inprocess_restart.maybe_force_nccl_backend_init(device_id)
+
+     # Set the tensor model-parallel, pipeline model-parallel, and
+     # data-parallel communicators.
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 3930cc46a..c30de90da 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -160,12 +160,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+ from megatron.core.transformer.module import Float16Module
+ from megatron.core.transformer.moe.paged_stash import PagedStashRunner
+-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
+-from megatron.core.distributed import DistributedDataParallel as DDP
+-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
+-from megatron.core.optimizer.optimizer import param_group_identifier_keys
+-
+-from megatron.core.optimizer.qk_clip import clip_qk
+ from megatron.core.utils import (
+     StragglerDetector,
+     check_param_hashes_across_dp_replicas,
+@@ -175,6 +169,7 @@ from megatron.core.utils import (
+     get_pg_rank,
+     get_pg_size,
+ )
++from megatron.training import high_availability as tft_ha
+ from megatron.training.checkpointing import (
+     checkpoint_exists,
+     get_loaded_iteration,
+@@ -295,7 +290,8 @@ def destroy_global_state():
+ def print_datetime(string, override_timestamp=None):
+     """Note that this call will sync across all ranks. Use override_timestamp if provided;
+        otherwise use current timestamp."""
+-    torch.distributed.barrier()
++    if not tft_ha.bootstrapping():
++        torch.distributed.barrier()
+     if override_timestamp is None:
+         time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+     else:
+@@ -1038,6 +1034,7 @@ def pretrain(
+     non_loss_data_func=None,
+     store=None,
+     inprocess_call_wrapper: Optional[Any] = None,
++    tft_recovery=None,
+ ):
+     """Main training program.
+
+@@ -1080,6 +1077,8 @@ def pretrain(
+             torch.distributed.init_process_group
+         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
+             it is automatically injected when in-process restart is in use
++        tft_recovery: optional customer provider of original-rank progress and
++            optimizer initialization keys for MindIO TFT ARF.
+     """
+     # Capture timestamp right at top of pretrain, before initialize_megatron
+     global _STARTUP_TIMESTAMPS
+@@ -1130,7 +1129,7 @@ def pretrain(
+
+     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
+     program_start_global = _TRAIN_START_TIME
+-    if _STARTUP_TIMESTAMPS['program_start'] is not None:
++    if _STARTUP_TIMESTAMPS['program_start'] is not None and not tft_ha.bootstrapping():
+         program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
+         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
+         program_start_global = program_start_global.item()
+@@ -1138,8 +1137,9 @@ def pretrain(
+
+     global _LEGACY_TRAIN_START_TIME
+     start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
+-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
+-    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
++    if not tft_ha.bootstrapping():
++        torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
++        _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
+
+     # Capture megatron init end time (matches original time.time() placement)
+     megatron_init_end = time.time()
+@@ -1158,7 +1158,10 @@ def pretrain(
+     print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
+     print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
+
+-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
++    if (
++        not tft_ha.bootstrapping()
++        and all(stamp is not None for stamp in (program_start, main_entry, pretrain_entry))
++    ):
+         # Inject startup deltas into timers
+         startup_timers = {
+             'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
+@@ -1227,10 +1230,11 @@ def pretrain(
+         checkpointing_context = {}
+
+     # Model, optimizer, and learning rate.
+-    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+-        model_provider, model_type, checkpointing_context=checkpointing_context
+-    )
++    timers('model-and-optimizer-setup', log_level=0).start(barrier=not tft_ha.bootstrapping())
++    with tft_ha.model_setup(tft_recovery):
++        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
++            model_provider, model_type, checkpointing_context=checkpointing_context
++        )
+
+     timers('model-and-optimizer-setup').stop()
+     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+@@ -1324,46 +1328,54 @@ def pretrain(
+
+     # Data stuff.
+     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+-    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+-    if args.virtual_pipeline_model_parallel_size is not None:
+-        train_data_iterator = []
+-        valid_data_iterator = []
+-        test_data_iterator = []
+-        for vp_stage in range(len(model)):
+-            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+-            assert "vp_stage" in dataset_provider_parameters, \
+-                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+-            vp_stage_train_valid_test_dataset_provider = \
+-                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
+-            iterators = build_train_valid_test_data_iterators(
+-                vp_stage_train_valid_test_dataset_provider
++    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=not tft_ha.bootstrapping())
++
++    def build_iterators():
++        if args.virtual_pipeline_model_parallel_size is not None:
++            train_data_iterator = []
++            valid_data_iterator = []
++            test_data_iterator = []
++            for vp_stage in range(len(model)):
++                dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
++                assert "vp_stage" in dataset_provider_parameters, \
++                    "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
++                vp_stage_train_valid_test_dataset_provider = \
++                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
++                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
++                    vp_stage_train_valid_test_dataset_provider.is_distributed = True
++                iterators = build_train_valid_test_data_iterators(
++                    vp_stage_train_valid_test_dataset_provider
++                )
++                train_data_iterator.append(iterators[0])
++                valid_data_iterator.append(iterators[1])
++                test_data_iterator.append(iterators[2])
++        else:
++            train_data_iterator, valid_data_iterator, test_data_iterator = (
++                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+             )
+-            train_data_iterator.append(iterators[0])
+-            valid_data_iterator.append(iterators[1])
+-            test_data_iterator.append(iterators[2])
+-    else:
+-        train_data_iterator, valid_data_iterator, test_data_iterator = (
+-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+-        )
++        return train_data_iterator, valid_data_iterator, test_data_iterator
++
++    iterators = (None, None, None) if tft_ha.bootstrapping() else build_iterators()
++    train_data_iterator, valid_data_iterator, test_data_iterator = iterators
+     timers('train/valid/test-data-iterators-setup').stop()
+     print_datetime('after dataloaders are built')
+     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+
+     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+-    one_logger_utils.track_config_flags(
+-        args.train_iters,
+-        cfg_container.validation.skip_train,
+-        args.do_train,
+-        args.do_valid,
+-        args.do_test,
+-        args.dataloader_type,
+-    )
++    if not tft_ha.bootstrapping():
++        one_logger_utils.track_config_flags(
++            args.train_iters,
++            cfg_container.validation.skip_train,
++            args.do_train,
++            args.do_valid,
++            args.do_test,
++            args.dataloader_type,
++        )
+
+     # Print setup timing.
+     print_rank_0('done with setup ...')
+-    timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
++    if not tft_ha.bootstrapping():
++        timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
+
+     one_logger = get_one_logger()
+     one_logger and one_logger.log_metrics(app_metrics)
+@@ -1381,20 +1393,33 @@ def pretrain(
+
+         iteration = 0
+         args.curr_iteration = iteration
+-        if args.do_train and (args.train_iters or 0) > 0:
+-            iteration, num_floating_point_operations_so_far = train(
+-                forward_step_func,
+-                model,
+-                optimizer,
+-                opt_param_scheduler,
+-                train_data_iterator,
+-                valid_data_iterator,
+-                process_non_loss_data_func,
+-                model_cfg,
+-                checkpointing_context,
+-                non_loss_data_func,
+-                inference_model,
+-            )
++        if tft_ha.bootstrapping() or (args.do_train and (args.train_iters or 0) > 0):
++
++            def run_train(train_iterator, valid_iterator):
++                return train(
++                    forward_step_func,
++                    model,
++                    optimizer,
++                    opt_param_scheduler,
++                    train_iterator,
++                    valid_iterator,
++                    process_non_loss_data_func,
++                    model_cfg,
++                    checkpointing_context,
++                    non_loss_data_func,
++                    inference_model,
++                )
++
++            if tft_ha.enabled():
++                (iteration, num_floating_point_operations_so_far), iterators = tft_ha.run(
++                    run_train, model, optimizer, opt_param_scheduler, model_cfg,
++                    checkpointing_context, build_iterators, iterators, tft_recovery,
++                )
++                train_data_iterator, valid_data_iterator, test_data_iterator = iterators
++            else:
++                iteration, num_floating_point_operations_so_far = run_train(
++                    train_data_iterator, valid_data_iterator
++                )
+
+         print_datetime('after training is done')
+
+@@ -2036,7 +2061,7 @@ def setup_model_and_optimizer(
+
+     if (
+         args.load is not None or args.pretrained_checkpoint is not None
+-    ) and not args.moe_use_upcycling:
++    ) and not args.moe_use_upcycling and not tft_ha.bootstrapping():
+         one_logger and one_logger.log_metrics(
+             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
+         )
+@@ -2081,6 +2106,7 @@ def setup_model_and_optimizer(
+     # get model without FP16 and/or DDP wrappers
+     if (
+         args.iteration == 0
++        and not tft_ha.bootstrapping()
+         and len(unwrapped_model) == 1
+         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert')
+     ):
+@@ -2284,6 +2310,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
+     # Update parameters.
+
+     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
++    tft_ha.begin(iteration + 1 if iteration is not None else None)
+     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+     # get max attention logit for logging and run clip_qk()
+@@ -3472,6 +3499,7 @@ def train(
+
+         # Completely skip iteration if needed.
+         if (iteration + 1) in args.iterations_to_skip:
++            tft_ha.begin(iteration + 1)
+             # Dummy train_step to fast forward train_data_iterator.
+             dummy_train_step(train_data_iterator)
+             if iteration == start_iteration:
+@@ -3482,6 +3510,8 @@ def train(
+             )
+             args.consumed_train_samples += batch_size
+             args.skipped_train_samples += batch_size
++            tft_ha.record_log({}, None, None)
++            tft_ha.commit(iteration, num_floating_point_operations_so_far)
+             continue
+
+         args.curr_iteration = iteration
+@@ -3742,6 +3772,9 @@ def train(
+             if args.num_experts is not None:
+                 get_moe_metrics_tracker().clear()
+
++        tft_ha.record_log(loss_dict, grad_norm, num_zeros_in_grad)
++        tft_ha.commit(iteration, num_floating_point_operations_so_far)
++
+         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
+         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
+         # (it is reset inside the callback after logging).
+@@ -4175,13 +4208,13 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
+     print_rank_0('> building train, validation, and test datasets ...')
+
+     # Backward compatibility, assume fixed batch size.
+-    if args.iteration > 0 and args.consumed_train_samples == 0:
++    if args.iteration > 0 and args.consumed_train_samples == 0 and tft_ha.allow_approximate_sampler_position():
+         assert (
+             args.train_samples is None
+         ), 'Only backward compatiblity support for iteration-based training'
+
+         args.consumed_train_samples = args.iteration * args.global_batch_size
+-    if args.iteration > 0 and args.consumed_valid_samples == 0:
++    if args.iteration > 0 and args.consumed_valid_samples == 0 and tft_ha.allow_approximate_sampler_position():
+         if args.train_samples is None:
+             effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
+             skipped_intervals = effective_start // args.eval_interval
+@@ -4245,6 +4278,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
+     else:
+         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+
++    tft_ha.configure_loader_rng(train_dataloader, valid_dataloaders, test_dataloader)
+     torch.distributed.broadcast(flags, 0)
+
+     args.do_train = getattr(args, "do_train", False) or flags[0].item()
