@@ -160,12 +160,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -175,6 +169,7 @@ from megatron.core.utils import (
     get_pg_rank,
     get_pg_size,
 )
+from megatron.training import high_availability as tft_ha
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -295,7 +290,8 @@ def destroy_global_state():
 def print_datetime(string, override_timestamp=None):
     """Note that this call will sync across all ranks. Use override_timestamp if provided;
        otherwise use current timestamp."""
-    torch.distributed.barrier()
+    if not tft_ha.bootstrapping():
+        torch.distributed.barrier()
     if override_timestamp is None:
         time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
     else:
@@ -1038,6 +1034,7 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
+    tft_recovery=None,
 ):
     """Main training program.
 
@@ -1080,6 +1077,8 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        tft_recovery: optional customer provider of original-rank progress and
+            optimizer initialization keys for MindIO TFT ARF.
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
@@ -1130,7 +1129,7 @@ def pretrain(
 
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
-    if _STARTUP_TIMESTAMPS['program_start'] is not None:
+    if _STARTUP_TIMESTAMPS['program_start'] is not None and not tft_ha.bootstrapping():
         program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
         program_start_global = program_start_global.item()
@@ -1138,8 +1137,9 @@ def pretrain(
 
     global _LEGACY_TRAIN_START_TIME
     start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
+    if not tft_ha.bootstrapping():
+        torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
+        _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
 
     # Capture megatron init end time (matches original time.time() placement)
     megatron_init_end = time.time()
@@ -1158,7 +1158,10 @@ def pretrain(
     print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
     print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
 
-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
+    if (
+        not tft_ha.bootstrapping()
+        and all(stamp is not None for stamp in (program_start, main_entry, pretrain_entry))
+    ):
         # Inject startup deltas into timers
         startup_timers = {
             'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
@@ -1227,10 +1230,11 @@ def pretrain(
         checkpointing_context = {}
 
     # Model, optimizer, and learning rate.
-    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
-    )
+    timers('model-and-optimizer-setup', log_level=0).start(barrier=not tft_ha.bootstrapping())
+    with tft_ha.model_setup(tft_recovery):
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context
+        )
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
@@ -1324,46 +1328,54 @@ def pretrain(
 
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for vp_stage in range(len(model)):
-            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
-            assert "vp_stage" in dataset_provider_parameters, \
-                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-            vp_stage_train_valid_test_dataset_provider = \
-                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
-            iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=not tft_ha.bootstrapping())
+
+    def build_iterators():
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for vp_stage in range(len(model)):
+                dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+                assert "vp_stage" in dataset_provider_parameters, \
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                vp_stage_train_valid_test_dataset_provider = \
+                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                iterators = build_train_valid_test_data_iterators(
+                    vp_stage_train_valid_test_dataset_provider
+                )
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator = (
+                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
             )
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
-        )
+        return train_data_iterator, valid_data_iterator, test_data_iterator
+
+    iterators = (None, None, None) if tft_ha.bootstrapping() else build_iterators()
+    train_data_iterator, valid_data_iterator, test_data_iterator = iterators
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
-    one_logger_utils.track_config_flags(
-        args.train_iters,
-        cfg_container.validation.skip_train,
-        args.do_train,
-        args.do_valid,
-        args.do_test,
-        args.dataloader_type,
-    )
+    if not tft_ha.bootstrapping():
+        one_logger_utils.track_config_flags(
+            args.train_iters,
+            cfg_container.validation.skip_train,
+            args.do_train,
+            args.do_valid,
+            args.do_test,
+            args.dataloader_type,
+        )
 
     # Print setup timing.
     print_rank_0('done with setup ...')
-    timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
+    if not tft_ha.bootstrapping():
+        timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
 
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
@@ -1381,20 +1393,33 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                model_cfg,
-                checkpointing_context,
-                non_loss_data_func,
-                inference_model,
-            )
+        if tft_ha.bootstrapping() or (args.do_train and (args.train_iters or 0) > 0):
+
+            def run_train(train_iterator, valid_iterator):
+                return train(
+                    forward_step_func,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    train_iterator,
+                    valid_iterator,
+                    process_non_loss_data_func,
+                    model_cfg,
+                    checkpointing_context,
+                    non_loss_data_func,
+                    inference_model,
+                )
+
+            if tft_ha.enabled():
+                (iteration, num_floating_point_operations_so_far), iterators = tft_ha.run(
+                    run_train, model, optimizer, opt_param_scheduler, model_cfg,
+                    checkpointing_context, build_iterators, iterators, tft_recovery,
+                )
+                train_data_iterator, valid_data_iterator, test_data_iterator = iterators
+            else:
+                iteration, num_floating_point_operations_so_far = run_train(
+                    train_data_iterator, valid_data_iterator
+                )
 
         print_datetime('after training is done')
 
@@ -2036,7 +2061,7 @@ def setup_model_and_optimizer(
 
     if (
         args.load is not None or args.pretrained_checkpoint is not None
-    ) and not args.moe_use_upcycling:
+    ) and not args.moe_use_upcycling and not tft_ha.bootstrapping():
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
@@ -2081,6 +2106,7 @@ def setup_model_and_optimizer(
     # get model without FP16 and/or DDP wrappers
     if (
         args.iteration == 0
+        and not tft_ha.bootstrapping()
         and len(unwrapped_model) == 1
         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert')
     ):
@@ -2284,6 +2310,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    tft_ha.begin(iteration + 1 if iteration is not None else None)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -3472,6 +3499,7 @@ def train(
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
+            tft_ha.begin(iteration + 1)
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -3482,6 +3510,8 @@ def train(
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
+            tft_ha.record_log({}, None, None)
+            tft_ha.commit(iteration, num_floating_point_operations_so_far)
             continue
 
         args.curr_iteration = iteration
@@ -3741,6 +3771,9 @@ def train(
                 energy_monitor.resume()
             if args.num_experts is not None:
                 get_moe_metrics_tracker().clear()
+
+        tft_ha.record_log(loss_dict, grad_norm, num_zeros_in_grad)
+        tft_ha.commit(iteration, num_floating_point_operations_so_far)
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -4175,13 +4208,13 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     print_rank_0('> building train, validation, and test datasets ...')
 
     # Backward compatibility, assume fixed batch size.
-    if args.iteration > 0 and args.consumed_train_samples == 0:
+    if args.iteration > 0 and args.consumed_train_samples == 0 and tft_ha.allow_approximate_sampler_position():
         assert (
             args.train_samples is None
         ), 'Only backward compatiblity support for iteration-based training'
 
         args.consumed_train_samples = args.iteration * args.global_batch_size
-    if args.iteration > 0 and args.consumed_valid_samples == 0:
+    if args.iteration > 0 and args.consumed_valid_samples == 0 and tft_ha.allow_approximate_sampler_position():
         if args.train_samples is None:
             effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
             skipped_intervals = effective_start // args.eval_interval
@@ -4245,6 +4278,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
 
+    tft_ha.configure_loader_rng(train_dataloader, valid_dataloaders, test_dataloader)
     torch.distributed.broadcast(flags, 0)
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()

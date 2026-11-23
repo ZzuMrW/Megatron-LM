@@ -26,12 +26,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
-from megatron.training import (
-    get_adlr_autoresume,
-    get_args,
-    get_tensorboard_writer,
-    inprocess_restart,
-)
+from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
+from megatron.training import high_availability as tft_ha
+from megatron.training import inprocess_restart
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
@@ -129,11 +126,9 @@ def initialize_megatron(
         # Megatron's MPU is the master. Complete initialization right away.
         finish_mpu_init()
 
-        # Autoresume.
-        _init_autoresume()
-
-        # Compile dependencies.
-        _compile_dependencies()
+        if not tft_ha.bootstrapping():
+            _init_autoresume()
+            _compile_dependencies()
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
@@ -246,6 +241,7 @@ def _initialize_tp_communicators():
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
+    tft_ha.start(args)
 
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
@@ -313,7 +309,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         # Call the init process
         init_process_group_kwargs = {
-            'backend': args.distributed_backend,
+            'backend': tft_ha.backend(args.distributed_backend),
             'store': store,
             'world_size': args.world_size,
             'rank': args.rank,
@@ -330,7 +326,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['store'] = store
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
-        inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if not tft_ha.bootstrapping():
+            inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
