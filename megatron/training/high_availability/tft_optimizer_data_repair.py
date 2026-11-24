@@ -2,7 +2,6 @@
 """Port the official TFT UCE/ARF repair dispatch and peer transfer order."""
 
 import io
-from logging import getLogger
 
 import torch
 import torch.distributed as dist
@@ -13,8 +12,6 @@ from megatron.training.checkpointing import load_checkpoint
 
 from .native_distopt import apply_leaf, export_leaf, stage_leaf
 from .tft_replica_group import build_repair_group, get_repair_group
-
-ttp_logger = getLogger(__name__)
 
 
 def repair_callback(step, need_rebuild, error_ranks, repair_info, training, ctx):
@@ -29,20 +26,8 @@ def repair_callback(step, need_rebuild, error_ranks, repair_info, training, ctx)
     if kind == RepairType.RT_UCE_LOWLEVEL and all(src == dst == rank for _, src, dst in records):
         training.require_state(step)
         return
-    if (
-        len(set(participants)) != len(participants)
-        or rank not in participants
-        or any(type(member) is not int or not 0 <= member < dist.get_world_size() for member in participants)
-    ):
-        raise ValueError("TFT repair has invalid participants")
-    if not records or len(records) != len(set(records)):
-        raise ValueError("TFT repair supplied missing or duplicate assignments")
     if kind in (RepairType.RT_LOAD_CKPT, RepairType.RT_LOAD_REBUILD):
-        if (
-            set(participants) != set(range(dist.get_world_size()))
-            or any(src != rank or dst != rank for _, src, dst in records)
-            or {domain for domain, _, _ in records} != set(range(len(training.domains)))
-        ):
+        if set(participants) != set(range(dist.get_world_size())):
             raise ValueError("The native checkpoint reader requires a whole-world TFT load action")
         load_ckpt_repair(training)
         return
@@ -55,16 +40,13 @@ def repair_callback(step, need_rebuild, error_ranks, repair_info, training, ctx)
     ):
         raise ValueError(f"Unsupported TFT repair action {kind}")
     for domain, source, destination in records:
-        if not 0 <= domain < len(training.domains) or source == destination:
-            raise ValueError("Invalid TFT repair domain or direction")
+        if domain < 0:
+            raise ValueError("TFT peer assignment uses an unknown optimizer domain")
         members, width, _ = training.domains[domain]
         if (
-            source not in members
-            or destination not in members
-            or source not in participants
-            or destination not in participants
-            or members.index(source) % width != members.index(destination) % width
+            source == destination
             or rank != (source if is_sender else destination)
+            or members.index(source) % width != members.index(destination) % width
         ):
             raise ValueError("TFT peer assignment does not match a native replica shard")
 
@@ -77,27 +59,14 @@ def repair_callback(step, need_rebuild, error_ranks, repair_info, training, ctx)
 
 def send_rank_repair(step, records, training):
     training.require_state(step)
-    args = get_args()
     exports = []
     for domain, _, destination in records:
-        leaves = []
-        tensors = []
+        leaves, tensors = {}, []
         for index, leaf in training.domains[domain][2]:
             state, owned = export_leaf(leaf, training.names)
-            leaves.append((index, state))
+            leaves[index] = state
             tensors.extend(owned)
-        save_and_send_ckpt(
-            destination,
-            {
-                'step': step,
-                'domain': domain,
-                'leaves': leaves,
-                'scheduler': training.progress['scheduler'],
-                'counters': training.progress['counters'],
-                'flops': training.progress['flops'],
-                'data_flags': (args.do_train, args.do_valid, args.do_test),
-            },
-        )
+        save_and_send_ckpt(destination, {'step': step, 'domain': domain, 'leaves': leaves})
         exports.append(tensors)
 
     for (_, _, destination), tensors in zip(records, exports, strict=True):
@@ -110,29 +79,18 @@ def send_rank_repair(step, records, training):
 def recv_rank_repair(step, records, training):
     domains = {domain for domain, _, _ in records}
     require_all = training.step != step or training.pending is not None or training.damaged
-    if len(domains) != len(records) or (require_all and domains != set(range(len(training.domains)))):
+    if require_all and domains != set(range(len(training.domains))):
         raise ValueError("TFT assignments do not restore all potentially invalid native leaves")
     progress = training.original_rank_progress(step)
     grouped = []
-    flags = None
     for domain, source, _ in records:
         metadata = recv_ckpt_from_peer(source)
         if metadata['step'] != step or metadata['domain'] != domain:
             raise ValueError("TFT peer returned a different step or optimizer domain")
-        if (
-            metadata['scheduler'] != progress['scheduler']
-            or metadata['counters'] != progress['counters']
-            or metadata['flops'] != progress['flops']
-        ):
-            raise ValueError("TFT peer and original rank disagree on completed-step counters")
-        if flags is not None and flags != metadata['data_flags']:
-            raise ValueError("TFT donors disagree on data-iterator flags")
-        flags = metadata['data_flags']
-        stages = []
-        for (index, leaf), (remote_index, state) in zip(training.domains[domain][2], metadata['leaves'], strict=True):
-            if index != remote_index:
-                raise ValueError("TFT peer returned a different optimizer leaf")
-            stages.append((leaf, stage_leaf(leaf, training.names, state)))
+        stages = [
+            (leaf, stage_leaf(leaf, training.names, metadata['leaves'][index]))
+            for index, leaf in training.domains[domain][2]
+        ]
         grouped.append((source, stages))
 
     updates = []
@@ -152,8 +110,6 @@ def recv_rank_repair(step, records, training):
     for leaf, stage, tensors in updates:
         apply_leaf(leaf, stage, tensors)
     torch.npu.synchronize()
-    args = get_args()
-    args.do_train, args.do_valid, args.do_test = flags
     training.received = progress
     training.step, training.pending, training.damaged = step, None, False
 
@@ -171,8 +127,6 @@ def save_and_send_ckpt(destination, state_dict):
 def recv_ckpt_from_peer(source):
     size = torch.empty(1, dtype=torch.long, device='npu')
     dist.recv(size, src=source, group=get_repair_group())
-    if size.item() <= 0:
-        raise ValueError("TFT peer sent an empty memory checkpoint")
     payload = torch.empty(size.item(), dtype=torch.uint8, device='npu')
     dist.recv(payload, src=source, group=get_repair_group())
     buffer = io.BytesIO(payload.cpu().numpy().tobytes())
@@ -203,8 +157,6 @@ def recv_log_args(source, training):
         loss = torch.empty(1, dtype=torch.float32, device='npu')
         dist.recv(loss, src=source, group=get_repair_group())
         loss = loss.item()
-    elif size.item() != -1:
-        raise ValueError("TFT peer log loss frame is invalid")
     stats = []
     for _ in range(2):
         value = torch.empty(1, dtype=torch.float32)
@@ -216,8 +168,8 @@ def recv_log_args(source, training):
 def load_ckpt_repair(training):
     """Load the native checkpoint only for TFT's two disk actions."""
     args = get_args()
-    if not args.load:
-        raise ValueError("TFT requested disk recovery without --load")
+    if args.no_load_optim or args.no_load_rng:
+        raise ValueError("TFT disk recovery requires optimizer and RNG state")
     training.damaged = True
     for field in training.counters:
         setattr(args, field, 0)

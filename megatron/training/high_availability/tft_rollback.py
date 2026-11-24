@@ -29,11 +29,9 @@ def rollback_callback(step, training, ctx):
         step = training.received['step']
     training.require_state(step)
     progress = training.received or training.original_rank_progress(step)
-    if progress['step'] != step:
-        raise ValueError("TFT rollback progress differs from the selected step")
     training.damaged = True
-    for key, value in progress['counters'].items():
-        setattr(args, key, value)
+    for key in training.counters:
+        setattr(args, key, progress['counters'][key])
     args.iteration = args.curr_iteration = step
     args.num_floating_point_operations_so_far = progress['flops']
     training.scheduler.num_steps = 0

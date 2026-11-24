@@ -39,8 +39,6 @@ def tft_init_controller_processor():
         processor_ip = ttp_ip
     port = 8000
 
-    if os.getenv('MINDIO_FOR_MINDSPORE', '').lower() in ('true', '1'):
-        raise RuntimeError("Megatron TFT requires the PyTorch SDK mode")
     os.environ['TTP_STOP_CLEAN_BEFORE_DUMP'] = '1'
     start_controller = args.rank == 0 and os.getenv('MINDX_TASK_ID') is None
     if start_controller:
@@ -155,8 +153,8 @@ class TrainingState:
             tft.tft_end_updating_os(self.step)
 
     def begin(self, step):
-        if self.pending is not None or self.damaged or step != self.step + 1:
-            raise RuntimeError("TFT optimizer update is outside the completed step boundary")
+        if self.pending is not None or self.damaged:
+            raise RuntimeError("TFT cannot start an update while native state is incomplete")
         tft.tft_start_updating_os()
         self.pending = step
 
@@ -177,16 +175,12 @@ class TrainingState:
             raise ValueError(f"TFT action requires valid native state at completed step {step}")
 
     def original_rank_progress(self, step):
-        if self.progress is not None and self.progress['step'] == step:
-            progress = self.progress
-        elif self.recovery is not None:
-            progress = self.recovery.rank_progress(get_args().rank, step)
-        else:
-            raise ValueError(f"TFT has no original-rank progress at step {step}")
-        if progress is None or (progress['rank'], progress['step']) != (get_args().rank, step):
-            raise ValueError("TFT recovery progress belongs to a different rank or step")
-        if set(progress['counters']) != set(self.counters):
-            raise ValueError("TFT requires the completed step's sample counters")
+        rank = get_args().rank
+        progress = self.progress
+        if progress is None or progress['step'] != step:
+            progress = self.recovery.rank_progress(rank, step) if self.recovery is not None else None
+        if progress is None or (progress['rank'], progress['step']) != (rank, step):
+            raise ValueError(f"TFT needs completed-step progress for rank {rank} at step {step}")
         return progress
 
 

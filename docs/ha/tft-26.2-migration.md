@@ -20,7 +20,7 @@
 | `core/HA/tft_replica_optimizer*.py` 与 `tft_replica_chainedoptimizer.py` 的 step；官方 `training.py::train` | 保留 TFT 更新起止和 pause 的顺序 | 旧 `current_step`、独立 leaf step 和 buffer cache 换成顶层 optimizer 事务。设备完成、scheduler 和实际样本计数完成后才提交 | `training.py::train_step/train`、`tft_train_initialize.py` |
 | `core/HA/tft_dump.py::tft_save_callback/get_checkpoint_name/save_checkpoint/tft_rename_callback` | 验证 TFT 选人，列表首项 writer，临时目录及 TFT 通知发布 | `set_dump_args/need_write_file/sync_gather_all_model_params` 和旧 `save_parameter_state` 绑定旧副本组。按 native bucket 与实际顺序收集，写目标 legacy 文件再更新 tracker | `tft_dump.py`、`native_distopt.py` |
 | `core/HA/tft_stop_clean.py::stop_callback/clean_callback/model_update_npu_tensor_to_safe/unset_gather_handle/torch_sync` | stop，分级 clean，按 retry 恢复 HCCL，重启设备；清理 DDP 句柄 | `optim.update_npu_tensor_to_safe()` 改为遍历 native leaf，访问原生 DDP buffer 与 optimizer 键 | `tft_stop_clean.py`、`tft_tensor_recovery.py` |
-| `core/HA/tft_optimizer_data_repair.py::repair_callback/send_rank_repair/recv_rank_repair/save_and_send_ckpt/recv_ckpt_from_peer` | 由 TFT repair_type 分派，建立临时组，先传内存元数据，再传 optimizer shard。沿用大小、序列化张量和 point-to-point 次序 | `state_dict_memory/state_dict_by_idx/load_state_dict_memory` 及 `send_optim_param_state/recv_and_load_optim_param_state` 改为实际 leaf、native range 和状态访问；验收目标 rank 的本地进度 | `tft_optimizer_data_repair.py`、`native_distopt.py` |
+| `core/HA/tft_optimizer_data_repair.py::repair_callback/send_rank_repair/recv_rank_repair/save_and_send_ckpt/recv_ckpt_from_peer` | 由 TFT repair_type 分派，建立临时组，先传分片元数据，再传 optimizer shard 和日志值。恢复进度由目标 rank 提供 | `state_dict_memory/state_dict_by_idx/load_state_dict_memory` 及 `send_optim_param_state/recv_and_load_optim_param_state` 改为实际 leaf、native range 和状态访问；验收目标 rank 的本地进度 | `tft_optimizer_data_repair.py`、`native_distopt.py` |
 | 同文件 `load_ckpt_repair` | 只响应两个 TFT 磁盘动作，走原生 checkpoint loader 并汇报实际加载步 | 移除旧精度工具的 tracker 改写；固定版原生 loader 集合通信需要整 world 一致 | `tft_optimizer_data_repair.py` |
 | `core/HA/tft_rollback.py::rollback_callback/feature_rollback/build_dataset/rebuild_global_vars/gather_model_params_from_optimizer`；`tasks/HA/dataloader_patch.py` | 保留清理、copy → gather、迭代器重建、同步、释放修复组及恢复训练位置的顺序 | `_copy_main_params_to_model_params` 按 native leaf，`sync_gather_all_model_params` 改为原生 DDP `start_param_sync(force_sync=True)`。恢复已有 scheduler 前复位步数；0.18 用原生 builder 重建 iterator | `tft_rollback.py`、`dataloader_patch.py` |
 | `tasks/HA/communication_patch.py::*wrapper`、`core/HA/tft_arf_group_repair.py::update_arf_reboot_flag/arf_rebuild_process_group_callback/init_* /update_model_and_optim_related_group` | 保留本地先启动、保存和还原 load 路径、TFT 重建通知、world → 并行组 → optimizer 组 → 句柄重绑 | 0.18 的组成员来自 native group 创建，Gloo 是否重建与旧句柄非空无关。使用 TorchNPU 原句柄重连 HCCL。原生 optimizer 启动的返回值不能用旧 wrapper 跳过 | `initialize_patch.py`、`communication_patch.py`、`tft_arf_group_repair.py` |
@@ -49,7 +49,7 @@
   `--num-distributed-optimizer-instances 2`、`--rerun-mode disabled`、
   `--num-workers 0` 和 `--save`。周期 checkpoint 可保持客户原生格式。
   现有 Ascend kernel、设备适配和 TorchNPU 原位重连能力由客户部署提供。
-- 官方 wheel 的 VERSION 构建脚本记录组件路径最后一次变更，`6cb6683c` tag 对应
+- 部署时通过 wheel 的 VERSION 核对来源。官方构建脚本记录组件路径最后一次变更，`6cb6683c` tag 对应
   `9a28823c002d113d109c369e4faf8790ddcd8d0a` 的组件树。
 - 临终目录继续使用临时目录与 rename。列表首项是 TFT writer，固定 SDK 的逻辑
   shard 选择使其同时覆盖 shard 0。汇聚中按进程组实际顺序重新定位各 shard。

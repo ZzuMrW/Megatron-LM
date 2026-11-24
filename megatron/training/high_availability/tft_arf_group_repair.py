@@ -62,15 +62,8 @@ def _phase(record):
 
 def arf_rebuild_process_group_callback(fault_ranks, training, ctx):
     """Reconnect world, parallel groups and optimizer groups in the TFT ARF callback."""
-    if not get_args().enable_worker_reboot or not inventory:
-        raise ValueError("TFT ARF has no registered Megatron group inventory")
     rank = dist.get_rank()
-    if (
-        not fault_ranks
-        or len(set(fault_ranks)) != len(fault_ranks)
-        or any(type(fault) is not int or not 0 <= fault < dist.get_world_size() for fault in fault_ranks)
-        or (rank in fault_ranks) != tft_is_arf_reboot_node()
-    ):
+    if (rank in fault_ranks) != tft_is_arf_reboot_node():
         raise ValueError("TFT ARF replacement list differs from local processor status")
 
     timers = get_timers()
@@ -78,20 +71,16 @@ def arf_rebuild_process_group_callback(fault_ranks, training, ctx):
     previous = os.environ.get('TORCH_DIST_INIT_BARRIER')
     os.environ['TORCH_DIST_INIT_BARRIER'] = '1'
     try:
-        _reconnect(None)
+        dist.reinit_process_group(group=None, rebuild_link=True)
         replacements, old_groups = {}, []
         for record in sorted(inventory, key=_phase):
             if rank not in record.ranks:
                 continue
-            if record.backend == 'hccl':
-                _reconnect(record.handle)
-                if tuple(dist.get_process_group_ranks(record.handle)) != record.ranks:
-                    raise RuntimeError("ARF changed native HCCL shard order")
+            if record.backend != 'gloo':
+                dist.reinit_process_group(group=record.handle, rebuild_link=True)
                 continue
             old = record.handle
             record.handle = dist.new_group(**dict(record.kwargs, use_local_synchronization=True))
-            if tuple(dist.get_process_group_ranks(record.handle)) != record.ranks:
-                raise RuntimeError("ARF changed native Gloo shard order")
             replacements[id(old)] = record.handle
             if not isinstance(old, DeferredGloo):
                 old_groups.append(old)
@@ -108,14 +97,6 @@ def arf_rebuild_process_group_callback(fault_ranks, training, ctx):
         else:
             os.environ['TORCH_DIST_INIT_BARRIER'] = previous
     ttp_logger.info("TFT rank %d restored native process groups", rank)
-
-
-def _reconnect(group):
-    world = dist.group.WORLD
-    expected = world if group is None else group
-    result = dist.reinit_process_group(group=group, rebuild_link=True)
-    if dist.group.WORLD is not world or (result is not None and result is not expected):
-        raise RuntimeError("ARF requires TorchNPU in-place HCCL process-group reconnection")
 
 
 def update_model_and_optim_related_group(training, replacements):

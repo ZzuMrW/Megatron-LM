@@ -27,10 +27,7 @@ def build_repair_group(rank_list: list):
 
 
 def get_repair_group(use_gloo: bool = False):
-    global REPAIR_GROUP, REPAIR_GROUP_GLOO
-    if use_gloo:
-        return REPAIR_GROUP_GLOO
-    return REPAIR_GROUP
+    return REPAIR_GROUP_GLOO if use_gloo else REPAIR_GROUP
 
 
 def destroy_repair_group():
@@ -76,6 +73,4 @@ def optimizer_domains(optimizer, args):
         result.append((members, width, bound))
     if sorted(index for _, _, domain_leaves in result for index, _ in domain_leaves) != list(range(len(leaves))):
         raise RuntimeError("TFT could not bind every native optimizer leaf to a unique domain")
-    if any(leaf.grad_scaler is not None for leaf in leaves):
-        raise RuntimeError("TFT native BF16 repair requires the unity loss scale")
     return result

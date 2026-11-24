@@ -38,7 +38,7 @@ Megatron-LM/
 │       └── high_availability/
 │           ├── __init__.py                     # 向训练入口提供 TFT 启用、启动和步更新接口
 │           ├── high_availability_helper.py      # 解析 HIGH_AVAILABILITY 并设置各能力开关
-│           ├── initialize_patch.py             # 校验启动参数和 wheel，绑定 NPU 并启动 TFT
+│           ├── initialize_patch.py             # 在 world 建立前绑定 NPU 并启动 TFT
 │           ├── tft_train_initialize.py          # 启动 controller/processor，注册回调，保存完成步进度
 │           ├── tft_replica_group.py             # 绑定原生优化器域与副本，管理临时 HCCL/Gloo 修复组
 │           ├── native_distopt.py                # 读取原生分片区间，校验并写回 Adam 张量和元数据
@@ -60,7 +60,7 @@ Megatron-LM/
 
 ## 二、准备运行环境与启动参数
 
-先确认客户的 Ascend 训练栈已能运行原生 BF16 Adam 和 Partial DistOpt。适配入口要求固定 world size、HCCL、可用的 Gloo 组、至少两个 optimizer 实例、`single` 或 `cyclic` sampler，并要求配置 `--save`。以下是两实例任务应并入现有启动命令的参数片段；模型、数据和并行参数沿用客户配置。
+先确认客户的 Ascend 训练栈已能运行原生 BF16 Adam 和 Partial DistOpt。示例以固定 world size、HCCL、可用的 Gloo 组和至少两个 optimizer 实例为前提，使用`single` 或 `cyclic` sampler 和 `--save`。以下是两实例任务应并入现有启动命令的参数片段；模型、数据和并行参数沿用客户配置。
 
 ```text
 --bf16 --optimizer adam --use-distributed-optimizer
@@ -69,12 +69,12 @@ Megatron-LM/
 --save <checkpoint目录>
 ```
 
-原生优化器在每个实例内分片。Dense 使用 DP×CP 域，Expert 使用 EDP 域，各域大小须能被实例数整除。程序还会检查域内 rank 顺序、实例内分片位置以及跨实例组是否一致。通过整除检查只能说明分片大小可行；只有对应位置确实持有相同分片时，TFT 选出的 rank 才能提供所需数据。FSDP、precision-aware optimizer、CPU offload、FP8/FP4、异步保存等组合在当前入口会被拒绝。完整的启动约束见[参数与设备检查](../../megatron/training/high_availability/initialize_patch.py)。
+原生优化器在每个实例内分片。Dense 使用 DP×CP 域，Expert 使用 EDP 域，各域大小须能被实例数整除。程序还会检查域内 rank 顺序、实例内分片位置以及跨实例组是否一致。通过整除检查只能说明分片大小可行；只有对应位置确实持有相同分片时，TFT 选出的 rank 才能提供所需数据。FSDP、precision-aware optimizer、CPU offload、FP8/FP4 和异步保存超出本示例的适配范围。
 
 | 配置项 | 客户需要设置或确认的内容 |
 | --- | --- |
 | `HIGH_AVAILABILITY` | `dump` 开启基础 HA 和临终保存；`retry` 开启基础 HA 和 UCE；`recover` 开启基础 HA 和 ARF。需要三项能力时使用 `export HIGH_AVAILABILITY=retry,recover`。开关可用逗号组合，大小写不敏感。 |
-| TFT wheel | 入口检查 `mindio_ttp` 发行版本为 `26.2.0`，并核对 wheel 内的 `mindio_ttp/VERSION`。其中的 Git 标识是 TFT 组件最后一次变更 `9a28823c002d113d109c369e4faf8790ddcd8d0a`；仓库发布 tag 指向 `6cb6683c`。应以组件标识核对 wheel。 |
+| TFT wheel | 部署时按 `mindio_ttp` 发行版本 `26.2.0` 和 wheel 内的 `mindio_ttp/VERSION` 核对来源。对应的 Git 标识为 TFT 组件最后一次变更 `9a28823c002d113d109c369e4faf8790ddcd8d0a`；仓库发布 tag 指向 `6cb6683c`。应以组件标识核对 wheel。 |
 | 地址、端口与 controller | `CONTROLLER_ADDR` 和 `PROCESSOR_ADDR` 沿用 26.2.0 的配置，默认地址回退到 `TTP_ADDR`，端口为 8000。设置 `MINDX_TASK_ID` 时由 MindX 提供外置 controller，否则由 rank 0 启动 controller。需要替换 rank 0 的部署应使用独立于该训练进程的 controller。当前补丁沿用来源代码的非 TLS 启动参数；现网要求 TLS 时，须先适配 SDK 启动参数与证书配置。 |
 | ARF 运行环境 | 启动器应能在原作业中恢复相同的逻辑 rank 和 world size，并接入原作业 rendezvous。TorchNPU 需提供 `reinit_process_group` 及 HCCL 原句柄重连能力。替换进程还要取得原 rank 的启动元数据，具体接口见下文。 |
 
@@ -104,7 +104,7 @@ Megatron-LM/
 
 假设两个实例分别包含 `[0,1,2,3]` 和 `[4,5,6,7]`。rank 0 和 4 持有相同位置的分片。若 TFT 选出 `[4,1,2,3]`，rank 4 提供逻辑分片 0，也是 TFT 指定的 writer。若临时 Gloo 组的实际顺序为 `[1,2,3,4]`，直接拼接收集结果就会把分片 0 写到末尾。因此，保存回调先确认每个逻辑位置恰有一份数据，再读取通信组的实际顺序，按原生 bucket 的区间重新排列。
 
-writer 将模型和训练元数据写入 `model_optim_rng.pt`，将原生优化器分片写入 `distrib_optim.pt`。TFT 通知 rename 时，回调核对各 TP/PP 位置的文件存在且非空，发布 `iter_<step>` 目录后再替换 tracker。若目标目录已存在，或 tracker 已指向相同或更晚的步，当前实现会拒绝覆盖。
+writer 将模型和训练元数据写入 `model_optim_rng.pt`，将原生优化器分片写入 `distrib_optim.pt`。TFT 通知 rename 时，回调核对各 TP/PP 位置的文件存在且非空，发布 `iter_<step>` 目录后再替换 tracker。已含 checkpoint 的目录由 rename 的文件系统语义保护，tracker 指向相同或更晚的步时本次发布终止。
 
 | 周期 checkpoint 配置 | 临终文件位置 | 重新启动时的加载参数 |
 | --- | --- | --- |

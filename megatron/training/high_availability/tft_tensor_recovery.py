@@ -52,10 +52,7 @@ def restore_model_tensors(models, values):
     """Restore the original rank's completed-step persistent tensor values."""
     from megatron.core.utils import unwrap_model
 
-    tensors = dict(model_tensors(models))
-    if tensors.keys() != values.keys():
-        raise ValueError("TFT saved different native model-buffer ownership")
-    for key, target in tensors.items():
+    for key, target in model_tensors(models):
         source = values[key]
         if target.shape != source.shape or target.dtype != source.dtype:
             raise ValueError(f"TFT model buffer layout differs for {key}")

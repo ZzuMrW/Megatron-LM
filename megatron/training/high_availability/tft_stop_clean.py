@@ -58,41 +58,27 @@ def clean_callback(is_uce_error: bool, training, ctx):
 
 
 def model_update_npu_tensor_to_safe(models):
-    from torch_npu.npu._recovery import update_npu_tensor_to_safe as update_tensor_to_safe
+    from torch_npu.npu._recovery import (
+        update_npu_tensor_to_safe as update_tensor_to_safe,
+    )
 
     for _, tensor in model_tensors(models):
         if tensor.device.type == 'npu':
             update_tensor_to_safe(tensor)
     for model in models:
-        for buffer in model.buffers:
+        for buffer in model.buffers + model.expert_parallel_buffers:
             for bucket in buffer.buckets:
-                if bucket.param_data is not None:
-                    update_tensor_to_safe(bucket.param_data)
-                if bucket.grad_data is not None:
-                    update_tensor_to_safe(bucket.grad_data)
-        for buffer in model.expert_parallel_buffers:
-            for bucket in buffer.buckets:
-                if bucket.param_data is not None:
-                    update_tensor_to_safe(bucket.param_data)
-                if bucket.grad_data is not None:
-                    update_tensor_to_safe(bucket.grad_data)
+                for tensor in (bucket.param_data, bucket.grad_data):
+                    if tensor is not None:
+                        update_tensor_to_safe(tensor)
 
 
 def unset_gather_handle(models):
     for model in models:
-        for bucket_group in model.bucket_groups:
+        for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
             bucket_group.grad_reduce_handle = None
             bucket_group.param_gather_handle = None
             bucket_group.param_gather_dispatched = False
-            if bucket_group.next_param_gather_bucket_group:
-                bucket_group.next_param_gather_bucket_group.param_gather_handle = None
-
-        for bucket_group in model.expert_parallel_bucket_groups:
-            bucket_group.grad_reduce_handle = None
-            bucket_group.param_gather_handle = None
-            bucket_group.param_gather_dispatched = False
-            if bucket_group.next_param_gather_bucket_group:
-                bucket_group.next_param_gather_bucket_group.param_gather_handle = None
 
 
 def torch_sync():

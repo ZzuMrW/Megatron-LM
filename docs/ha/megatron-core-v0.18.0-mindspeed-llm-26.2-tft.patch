@@ -107,10 +107,10 @@ index 000000000..b4688390c
 +        _training.log_args = loss, grad_norm, num_zeros
 diff --git a/megatron/training/high_availability/communication_patch.py b/megatron/training/high_availability/communication_patch.py
 new file mode 100644
-index 000000000..6e544bebd
+index 000000000..2d6570b31
 --- /dev/null
 +++ b/megatron/training/high_availability/communication_patch.py
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,121 @@
 +# Adapted from mindspeed_llm/tasks/high_availability/communication_patch.py at effa8e78.
 +"""Keep replacement startup local and retain native group creation arguments."""
 +
@@ -166,8 +166,6 @@ index 000000000..6e544bebd
 +
 +    members = tuple(range(dist.get_world_size()) if ranks is None else sorted(ranks))
 +    actual_backend = backend or dist.get_backend()
-+    if actual_backend not in ('hccl', 'gloo'):
-+        raise ValueError(f"ARF cannot reconnect native backend {actual_backend}")
 +    kwargs = dict(
 +        ranks=list(members),
 +        timeout=timeout,
@@ -229,31 +227,11 @@ index 000000000..6e544bebd
 +            raise ValueError(f"ARF cannot defer startup reduction from {caller}")
 +        # Both tied-weight copies are restored from native DistOpt before training.
 +
-+    def reject(name):
-+        def unexpected(*args, **kwargs):
-+            raise ValueError(f"ARF startup collective {name} needs a customer-provided result")
-+
-+        return unexpected
-+
-+    guarded = {}
 +    dist.all_gather_object, dist.all_reduce = gather, reduce
 +    try:
-+        for name in (
-+            'barrier',
-+            'broadcast',
-+            'broadcast_object_list',
-+            'all_gather',
-+            'all_gather_into_tensor',
-+            'reduce_scatter_tensor',
-+            'all_to_all_single',
-+        ):
-+            guarded[name] = getattr(dist, name)
-+            setattr(dist, name, reject(name))
 +        yield
 +    finally:
 +        dist.all_gather_object, dist.all_reduce = original_gather, original_reduce
-+        for name, function in guarded.items():
-+            setattr(dist, name, function)
 diff --git a/megatron/training/high_availability/dataloader_patch.py b/megatron/training/high_availability/dataloader_patch.py
 new file mode 100644
 index 000000000..5d4fde06d
@@ -301,114 +279,37 @@ index 000000000..ed0b4c46a
 +    return args
 diff --git a/megatron/training/high_availability/initialize_patch.py b/megatron/training/high_availability/initialize_patch.py
 new file mode 100644
-index 000000000..a6f9c2124
+index 000000000..52e12467e
 --- /dev/null
 +++ b/megatron/training/high_availability/initialize_patch.py
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,20 @@
 +# Adapted from mindspeed_llm/tasks/high_availability/initialize_patch.py at effa8e78.
-+"""TFT startup and checks for the native Partial DistOpt entry point."""
-+
-+import os
-+from importlib.metadata import distribution
-+from pathlib import Path
++"""Bind the device and start TFT before creating the distributed world."""
 +
 +import torch.distributed as dist
 +
 +
 +def initialize_distributed(args):
 +    """Perform the official initialize_distributed_wrapper prelude."""
-+    if dist.is_initialized():
-+        raise RuntimeError("TFT must start before the job creates its distributed world")
-+    if not args.use_distributed_optimizer or args.num_distributed_optimizer_instances < 2:
-+        raise ValueError("TFT requires native distributed optimizer instances")
-+    if not args.bf16 or args.optimizer != 'adam':
-+        raise ValueError("TFT port supports native BF16 Adam")
-+    if args.distributed_backend not in ('nccl', 'hccl') or args.dataloader_type not in ('single', 'cyclic'):
-+        raise ValueError("TFT requires Ascend HCCL and a native sampler")
-+    if args.skip_train or args.rerun_mode != 'disabled' or args.num_workers != 0:
-+        raise ValueError("TFT requires training, --rerun-mode disabled and --num-workers 0")
-+    if not args.save or not args.use_gloo_process_groups:
-+        raise ValueError("TFT requires --save and Megatron Gloo groups")
-+    excluded = (
-+        'use_megatron_fsdp',
-+        'use_torch_fsdp2',
-+        'use_custom_fsdp',
-+        'use_layer_wise_distributed_optimizer',
-+        'use_precision_aware_optimizer',
-+        'loss_scale',
-+        'optimizer_cpu_offload',
-+        'fp8',
-+        'fp4',
-+        'data_parallel_random_init',
-+        'perform_rl_step',
-+        'vision_pretraining',
-+        'lazy_mpu_init',
-+        'inprocess_restart',
-+        'tp_comm_overlap',
-+        'use_sharp',
-+        'sharp_enabled_group',
-+        'optimizer_cuda_graph',
-+        'full_validation',
-+        'multiple_validation_sets',
-+        'phase_transition_iterations',
-+        'fake_process_group',
-+        'async_save',
-+        'non_persistent_ckpt_type',
-+        'force_create_nccl_p2p_group',
-+        'no_load_optim',
-+        'no_load_rng',
-+        'no_save_optim',
-+        'no_save_rng',
-+        'finetune',
-+        'log_progress',
-+        'moe_use_upcycling',
-+        'ckpt_convert_format',
-+        'dump_param_to_param_group_map',
-+    )
-+    unsupported = [name for name in excluded if getattr(args, name, None)]
-+    if unsupported or args.cuda_graph_impl != 'none':
-+        raise ValueError(
-+            f"TFT native adapter configuration is unsupported: {unsupported}, graph={args.cuda_graph_impl}"
-+        )
-+    device = int(os.environ.get('LOCAL_RANK', args.local_rank))
-+    if device != args.local_rank:
-+        raise ValueError("TFT LOCAL_RANK differs from Megatron local_rank")
-+    verify_tft_distribution()
 +    import torch_npu
 +
 +    from .communication_patch import install_new_group_wrapper
 +    from .tft_train_initialize import tft_init_controller_processor
 +
-+    torch_npu.npu.set_device(device)
-+    if (args.enable_hbmfault_repair or args.enable_worker_reboot) and not callable(
-+        getattr(dist, 'reinit_process_group', None)
-+    ):
-+        raise RuntimeError("TFT recovery requires TorchNPU reinit_process_group")
++    if dist.is_initialized():
++        raise RuntimeError("TFT must start before the job creates its distributed world")
++
++    torch_npu.npu.set_device(args.local_rank)
 +    tft_init_controller_processor()
 +    if args.enable_worker_reboot:
 +        install_new_group_wrapper()
-+
-+
-+def verify_tft_distribution():
-+    """Check the official wheel provenance before importing the native SDK."""
-+    wheel = distribution('mindio_ttp')
-+    version = Path(wheel.locate_file('mindio_ttp/VERSION')).read_text(encoding='utf-8').splitlines()
-+    # The release build records the latest commit affecting component/mindio/tft.
-+    if wheel.version != '26.2.0' or version != [
-+        'mindio_ttp version info:',
-+        'mindio_ttp version: 26.2.0',
-+        'git: 9a28823c002d113d109c369e4faf8790ddcd8d0a',
-+    ]:
-+        raise RuntimeError("TFT requires the official MindIO 26.2.0 component build")
 diff --git a/megatron/training/high_availability/native_distopt.py b/megatron/training/high_availability/native_distopt.py
 new file mode 100644
-index 000000000..558fee105
+index 000000000..d5a0543e4
 --- /dev/null
 +++ b/megatron/training/high_availability/native_distopt.py
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,86 @@
 +"""Native 0.18.0 shard access for the ported TFT callbacks."""
-+
-+import math
 +
 +import torch
 +
@@ -440,11 +341,7 @@ index 000000000..558fee105
 +        _, main = _master(leaf, parameter)
 +        native = leaf.optimizer.state.get(main, {})
 +        values = leaf._get_main_param_and_optimizer_states(parameter)
-+        if set(native) - {'exp_avg', 'exp_avg_sq', 'step'}:
-+            raise ValueError("TFT supports native Adam state keys")
-+        keys = tuple(key for key in ADAM_KEYS if key in values)
-+        if keys not in (('param',), ADAM_KEYS):
-+            raise ValueError("TFT found incomplete Adam moments")
++        keys = ADAM_KEYS if 'exp_avg' in values else ('param',)
 +        entries.append(
 +            (extent, tuple((key, values[key].shape, values[key].dtype) for key in keys), native.get('step'))
 +        )
@@ -456,7 +353,7 @@ index 000000000..558fee105
 +    """Check destination shard coordinates before any native state is modified."""
 +    groups = metadata['groups']
 +    for group, remote in zip(leaf.optimizer.param_groups, groups, strict=True):
-+        if 'params' in remote or any(group[key] != remote[key] for key in param_group_identifier_keys):
++        if any(group[key] != remote[key] for key in param_group_identifier_keys):
 +            raise ValueError("TFT optimizer group identifiers differ")
 +    entries = []
 +    for (parameter, current), (extent, specs, step) in zip(
@@ -470,10 +367,6 @@ index 000000000..558fee105
 +            raise ValueError("TFT peer supplied invalid Adam state keys")
 +        if any(shape != main.shape or dtype != main.dtype for _, shape, dtype in specs):
 +            raise ValueError("TFT peer supplied an incompatible native tensor")
-+        if step is not None:
-+            number = step.item() if isinstance(step, torch.Tensor) and step.ndim == 0 else step
-+            if not isinstance(number, (int, float)) or not math.isfinite(number) or number < 0:
-+                raise ValueError("TFT peer supplied an invalid Adam step")
 +        entries.append((main, specs, step, group_index))
 +    return groups, entries
 +
@@ -504,10 +397,10 @@ index 000000000..558fee105
 +            optimizer_state['step'] = step
 diff --git a/megatron/training/high_availability/tft_arf_group_repair.py b/megatron/training/high_availability/tft_arf_group_repair.py
 new file mode 100644
-index 000000000..a9e8f89c7
+index 000000000..23f60f6cb
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_arf_group_repair.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,114 @@
 +# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 +# Modifications Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
 +"""Port the official ARF group-rebuild callback to native 0.18.0 group ownership."""
@@ -572,15 +465,8 @@ index 000000000..a9e8f89c7
 +
 +def arf_rebuild_process_group_callback(fault_ranks, training, ctx):
 +    """Reconnect world, parallel groups and optimizer groups in the TFT ARF callback."""
-+    if not get_args().enable_worker_reboot or not inventory:
-+        raise ValueError("TFT ARF has no registered Megatron group inventory")
 +    rank = dist.get_rank()
-+    if (
-+        not fault_ranks
-+        or len(set(fault_ranks)) != len(fault_ranks)
-+        or any(type(fault) is not int or not 0 <= fault < dist.get_world_size() for fault in fault_ranks)
-+        or (rank in fault_ranks) != tft_is_arf_reboot_node()
-+    ):
++    if (rank in fault_ranks) != tft_is_arf_reboot_node():
 +        raise ValueError("TFT ARF replacement list differs from local processor status")
 +
 +    timers = get_timers()
@@ -588,20 +474,16 @@ index 000000000..a9e8f89c7
 +    previous = os.environ.get('TORCH_DIST_INIT_BARRIER')
 +    os.environ['TORCH_DIST_INIT_BARRIER'] = '1'
 +    try:
-+        _reconnect(None)
++        dist.reinit_process_group(group=None, rebuild_link=True)
 +        replacements, old_groups = {}, []
 +        for record in sorted(inventory, key=_phase):
 +            if rank not in record.ranks:
 +                continue
-+            if record.backend == 'hccl':
-+                _reconnect(record.handle)
-+                if tuple(dist.get_process_group_ranks(record.handle)) != record.ranks:
-+                    raise RuntimeError("ARF changed native HCCL shard order")
++            if record.backend != 'gloo':
++                dist.reinit_process_group(group=record.handle, rebuild_link=True)
 +                continue
 +            old = record.handle
 +            record.handle = dist.new_group(**dict(record.kwargs, use_local_synchronization=True))
-+            if tuple(dist.get_process_group_ranks(record.handle)) != record.ranks:
-+                raise RuntimeError("ARF changed native Gloo shard order")
 +            replacements[id(old)] = record.handle
 +            if not isinstance(old, DeferredGloo):
 +                old_groups.append(old)
@@ -620,14 +502,6 @@ index 000000000..a9e8f89c7
 +    ttp_logger.info("TFT rank %d restored native process groups", rank)
 +
 +
-+def _reconnect(group):
-+    world = dist.group.WORLD
-+    expected = world if group is None else group
-+    result = dist.reinit_process_group(group=group, rebuild_link=True)
-+    if dist.group.WORLD is not world or (result is not None and result is not expected):
-+        raise RuntimeError("ARF requires TorchNPU in-place HCCL process-group reconnection")
-+
-+
 +def update_model_and_optim_related_group(training, replacements):
 +    """Replace Gloo references; native DDP and schedule HCCL handles survive in place."""
 +    for name, value in tuple(vars(mpu).items()):
@@ -643,10 +517,10 @@ index 000000000..a9e8f89c7
 +    training.checkpointing.clear()
 diff --git a/megatron/training/high_availability/tft_dump.py b/megatron/training/high_availability/tft_dump.py
 new file mode 100644
-index 000000000..24171dc03
+index 000000000..2c73f9010
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_dump.py
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,183 @@
 +# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 +# Modifications Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
 +"""Port official dump selection, writer and rename to native 0.18.0 legacy files."""
@@ -674,7 +548,8 @@ index 000000000..24171dc03
 +
 +def _save_root(args):
 +    # Keep the legacy dump separate from a periodic torch_dist tracker.
-+    return Path(args.save) if args.ckpt_format == 'torch' else Path(str(args.save) + '.tft')
++    path = Path(args.save)
++    return path if args.ckpt_format == 'torch' else Path(f'{path}.tft')
 +
 +
 +def _temporary_directory(step):
@@ -685,33 +560,16 @@ index 000000000..24171dc03
 +    """Write the local legacy checkpoint contribution from TFT-selected shard ranks."""
 +    training.require_state(step)
 +    rank = dist.get_rank()
-+    selected = {}
-+    for entry in save_info:
-+        domain, ranks = entry['type'], tuple(entry['ranks'])
-+        if not 0 <= domain < len(training.domains) or domain in selected:
-+            raise ValueError("TFT save assignment has an invalid or duplicate optimizer domain")
-+        full, width, _ = training.domains[domain]
-+        if (
-+            rank not in ranks
-+            or any(member not in full for member in ranks)
-+            or sorted(full.index(member) % width for member in ranks) != list(range(width))
-+        ):
-+            raise ValueError("TFT save assignment must cover each logical shard exactly once")
-+        if full.index(ranks[0]) % width:
-+            raise ValueError("TFT save writer is outside the first logical shard")
-+        selected[domain] = ranks
-+
-+    if not selected:
-+        raise ValueError("TFT did not assign a local save contribution")
-+    # A legacy model_optim_rng file needs all domains for its model coordinate.
-+    # Frozen TFT only supplies local assignments, so require a common selection.
-+    ranks = next(iter(selected.values()))
-+    if (
-+        set(selected) != set(range(len(training.domains)))
-+        or any(selection != ranks for selection in selected.values())
-+        or get_args().expert_model_parallel_size != 1
-+    ):
++    selected = {entry['type']: tuple(entry['ranks']) for entry in save_info}
++    if set(selected) != set(range(len(training.domains))) or get_args().expert_model_parallel_size != 1:
 +        raise ValueError("Legacy TFT dump needs a common native-domain writer for each model file")
++
++    ranks = selected[0]
++    for domain, (members, width, _) in enumerate(training.domains):
++        if selected[domain] != ranks:
++            raise ValueError("Legacy TFT dump needs the same selected ranks for each optimizer domain")
++        if rank not in ranks or sorted(members.index(member) % width for member in ranks) != list(range(width)):
++            raise ValueError("TFT save assignment must cover each native shard exactly once")
 +
 +    writer = ranks[0]
 +    group = dist.new_group(list(ranks), backend='gloo', use_local_synchronization=True)
@@ -719,16 +577,12 @@ index 000000000..24171dc03
 +        actual = dist.get_process_group_ranks(group)
 +        model = unwrap_model(training.model)
 +        weights, packed = {}, {}
-+        for domain in sorted(selected):
-+            members, width, leaves = training.domains[domain]
++        for members, width, leaves in training.domains:
 +            order = sorted(range(len(actual)), key=lambda index: members.index(actual[index]) % width)
-+            shard = members.index(rank) % width
 +            for index, leaf in leaves:
-+                buffers, parameters = _gather_leaf(leaf, shard, width, order, writer, group)
++                buffers, parameters = _gather_leaf(leaf, order, writer, group)
 +                if rank == writer:
 +                    packed[index] = buffers
-+                    if weights.keys() & parameters.keys():
-+                        raise ValueError("Native optimizer leaves supplied overlapping parameters")
 +                    weights.update(parameters)
 +        if rank == writer:
 +            save_checkpoint(step, training, model, packed, weights)
@@ -736,7 +590,7 @@ index 000000000..24171dc03
 +        dist.destroy_process_group(group)
 +
 +
-+def _gather_leaf(leaf, shard, width, order, writer, group):
++def _gather_leaf(leaf, order, writer, group):
 +    """Gather and reorder native coalesced legacy buffers, using the TFT global writer."""
 +    is_writer = dist.get_rank() == writer
 +    packed = {'buckets_coalesced': True}
@@ -749,41 +603,14 @@ index 000000000..24171dc03
 +            offset = 0
 +            for bucket_index, ranges_by_parameter in enumerate(ranges):
 +                bucket = buffer.buckets[bucket_index]
-+                bucket_size = bucket.grad_data.numel()
-+                if bucket_size % width:
-+                    raise ValueError("Native bucket cannot be partitioned by the selected shards")
-+                size = bucket_size // width
++                size = bucket.grad_data.numel() // len(order)
 +                valid = bucket.numel_unpadded
 +                by_key = {key: torch.zeros(size, dtype=torch.float32) for key in ADAM_KEYS}
-+                bucket_parameters = {
-+                    param: (start - bucket.offset, end - bucket.offset)
-+                    for param, (start, end, owner) in buffer.param_index_map.items()
-+                    if owner == bucket_index
-+                }
-+                shard_start, shard_end = shard * size, (shard + 1) * size
-+                expected = {
-+                    param: (max(start, shard_start), min(end, shard_end))
-+                    for param, (start, end) in bucket_parameters.items()
-+                    if max(start, shard_start) < min(end, shard_end)
-+                }
-+                if expected.keys() != ranges_by_parameter['param_map'].keys():
-+                    raise ValueError("TFT dump shard coverage differs from the native bucket")
 +                for parameter, location in ranges_by_parameter['param_map'].items():
-+                    world = location['gbuf_world_in_bucket']
 +                    local = location['gbuf_local']
-+                    if not (
-+                        0 <= local.start < local.end <= size
-+                        and (world.start, world.end) == expected[parameter]
-+                        and (world.start, world.end) == (shard_start + local.start, shard_start + local.end)
-+                        and world.end <= valid
-+                    ):
-+                        raise ValueError("Native dump encountered a shard-range mismatch")
 +                    tensors = leaf._get_main_param_and_optimizer_states(parameter)
 +                    for key, piece in by_key.items():
-+                        value = tensors[key]
-+                        if value.dtype != torch.float32 or value.numel() != local.end - local.start:
-+                            raise ValueError("Native dump encountered incompatible Adam state")
-+                        piece[local.start : local.end].copy_(value.detach().view(-1).cpu())
++                        piece[local.start : local.end].copy_(tensors[key].detach().view(-1).cpu())
 +                for key, piece in by_key.items():
 +                    received = [torch.empty_like(piece) for _ in order] if is_writer else None
 +                    dist.gather(piece, gather_list=received, dst=writer, group=group)
@@ -792,15 +619,13 @@ index 000000000..24171dc03
 +                            torch.cat([received[index] for index in order])[:valid]
 +                        )
 +                if is_writer:
-+                    for parameter, (start, end) in bucket_parameters.items():
-+                        if not 0 <= start < end <= valid:
-+                            raise ValueError("Native dump encountered a parameter outside its bucket")
-+                        parameters[parameter] = (
-+                            state['param'][offset + start : offset + end].reshape(parameter.shape).to(parameter.dtype)
-+                        )
++                    for parameter, (start, end, owner) in buffer.param_index_map.items():
++                        if owner == bucket_index:
++                            left, right = offset + start - bucket.offset, offset + end - bucket.offset
++                            parameters[parameter] = (
++                                state['param'][left:right].reshape(parameter.shape).to(parameter.dtype)
++                            )
 +                offset += valid
-+            if offset != total:
-+                raise ValueError("Native dump coalesced layout differs from the reader")
 +            if is_writer:
 +                state['numel_unpadded'] = total
 +                packed.setdefault(buffer_index, {})[dtype] = state
@@ -810,6 +635,8 @@ index 000000000..24171dc03
 +def save_checkpoint(step, training, model, packed, weights):
 +    """Emit the native legacy reader's model metadata and chained optimizer file."""
 +    args = Namespace(**vars(get_args()))
++    if args.no_save_optim or args.no_save_rng:
++        raise ValueError("TFT legacy checkpoint requires optimizer and RNG state")
 +    args.ckpt_format, args.use_dist_ckpt = 'torch', False
 +    state = generate_state_dict(
 +        args,
@@ -837,8 +664,6 @@ index 000000000..24171dc03
 +    name = Path(get_checkpoint_name(str(_save_root(args)), step)).parent.name
 +    checkpoint = _temporary_directory(step) / name / 'model_optim_rng.pt'
 +    checkpoint.parent.mkdir(parents=True, exist_ok=True)
-+    if sorted(packed) != list(range(len(packed))):
-+        raise ValueError("TFT could not compose all native optimizer leaves")
 +    optimizer = packed[0] if len(packed) == 1 else [packed[i] for i in range(len(packed))]
 +    with open(get_distributed_optimizer_checkpoint_name(str(checkpoint)), 'xb') as stream:
 +        torch.save(optimizer, stream)
@@ -869,31 +694,26 @@ index 000000000..24171dc03
 +            optimizer_file = Path(get_distributed_optimizer_checkpoint_name(str(model_file)))
 +            if any(not path.is_file() or path.stat().st_size == 0 for path in (model_file, optimizer_file)):
 +                raise ValueError(f"TFT dump lacks complete files for TP {tensor_rank} PP {pipeline_rank}")
-+    if destination.exists():
-+        raise FileExistsError(f"TFT checkpoint directory already exists: {destination}")
 +    stage.rename(destination)
-+    temporary = None
++    stream = NamedTemporaryFile(mode='w', dir=root, delete=False)
 +    try:
-+        with NamedTemporaryFile(mode='w', dir=root, delete=False) as stream:
-+            temporary = Path(stream.name)
++        with stream:
 +            stream.write(str(step))
 +            stream.flush()
 +            os.fsync(stream.fileno())
-+        os.replace(temporary, tracker)
++        os.replace(stream.name, tracker)
 +    finally:
-+        if temporary is not None:
-+            temporary.unlink(missing_ok=True)
++        Path(stream.name).unlink(missing_ok=True)
 diff --git a/megatron/training/high_availability/tft_optimizer_data_repair.py b/megatron/training/high_availability/tft_optimizer_data_repair.py
 new file mode 100644
-index 000000000..2634035ac
+index 000000000..24bb486e5
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_optimizer_data_repair.py
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,186 @@
 +# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
 +"""Port the official TFT UCE/ARF repair dispatch and peer transfer order."""
 +
 +import io
-+from logging import getLogger
 +
 +import torch
 +import torch.distributed as dist
@@ -904,8 +724,6 @@ index 000000000..2634035ac
 +
 +from .native_distopt import apply_leaf, export_leaf, stage_leaf
 +from .tft_replica_group import build_repair_group, get_repair_group
-+
-+ttp_logger = getLogger(__name__)
 +
 +
 +def repair_callback(step, need_rebuild, error_ranks, repair_info, training, ctx):
@@ -920,20 +738,8 @@ index 000000000..2634035ac
 +    if kind == RepairType.RT_UCE_LOWLEVEL and all(src == dst == rank for _, src, dst in records):
 +        training.require_state(step)
 +        return
-+    if (
-+        len(set(participants)) != len(participants)
-+        or rank not in participants
-+        or any(type(member) is not int or not 0 <= member < dist.get_world_size() for member in participants)
-+    ):
-+        raise ValueError("TFT repair has invalid participants")
-+    if not records or len(records) != len(set(records)):
-+        raise ValueError("TFT repair supplied missing or duplicate assignments")
 +    if kind in (RepairType.RT_LOAD_CKPT, RepairType.RT_LOAD_REBUILD):
-+        if (
-+            set(participants) != set(range(dist.get_world_size()))
-+            or any(src != rank or dst != rank for _, src, dst in records)
-+            or {domain for domain, _, _ in records} != set(range(len(training.domains)))
-+        ):
++        if set(participants) != set(range(dist.get_world_size())):
 +            raise ValueError("The native checkpoint reader requires a whole-world TFT load action")
 +        load_ckpt_repair(training)
 +        return
@@ -946,16 +752,13 @@ index 000000000..2634035ac
 +    ):
 +        raise ValueError(f"Unsupported TFT repair action {kind}")
 +    for domain, source, destination in records:
-+        if not 0 <= domain < len(training.domains) or source == destination:
-+            raise ValueError("Invalid TFT repair domain or direction")
++        if domain < 0:
++            raise ValueError("TFT peer assignment uses an unknown optimizer domain")
 +        members, width, _ = training.domains[domain]
 +        if (
-+            source not in members
-+            or destination not in members
-+            or source not in participants
-+            or destination not in participants
-+            or members.index(source) % width != members.index(destination) % width
++            source == destination
 +            or rank != (source if is_sender else destination)
++            or members.index(source) % width != members.index(destination) % width
 +        ):
 +            raise ValueError("TFT peer assignment does not match a native replica shard")
 +
@@ -968,27 +771,14 @@ index 000000000..2634035ac
 +
 +def send_rank_repair(step, records, training):
 +    training.require_state(step)
-+    args = get_args()
 +    exports = []
 +    for domain, _, destination in records:
-+        leaves = []
-+        tensors = []
++        leaves, tensors = {}, []
 +        for index, leaf in training.domains[domain][2]:
 +            state, owned = export_leaf(leaf, training.names)
-+            leaves.append((index, state))
++            leaves[index] = state
 +            tensors.extend(owned)
-+        save_and_send_ckpt(
-+            destination,
-+            {
-+                'step': step,
-+                'domain': domain,
-+                'leaves': leaves,
-+                'scheduler': training.progress['scheduler'],
-+                'counters': training.progress['counters'],
-+                'flops': training.progress['flops'],
-+                'data_flags': (args.do_train, args.do_valid, args.do_test),
-+            },
-+        )
++        save_and_send_ckpt(destination, {'step': step, 'domain': domain, 'leaves': leaves})
 +        exports.append(tensors)
 +
 +    for (_, _, destination), tensors in zip(records, exports, strict=True):
@@ -1001,29 +791,18 @@ index 000000000..2634035ac
 +def recv_rank_repair(step, records, training):
 +    domains = {domain for domain, _, _ in records}
 +    require_all = training.step != step or training.pending is not None or training.damaged
-+    if len(domains) != len(records) or (require_all and domains != set(range(len(training.domains)))):
++    if require_all and domains != set(range(len(training.domains))):
 +        raise ValueError("TFT assignments do not restore all potentially invalid native leaves")
 +    progress = training.original_rank_progress(step)
 +    grouped = []
-+    flags = None
 +    for domain, source, _ in records:
 +        metadata = recv_ckpt_from_peer(source)
 +        if metadata['step'] != step or metadata['domain'] != domain:
 +            raise ValueError("TFT peer returned a different step or optimizer domain")
-+        if (
-+            metadata['scheduler'] != progress['scheduler']
-+            or metadata['counters'] != progress['counters']
-+            or metadata['flops'] != progress['flops']
-+        ):
-+            raise ValueError("TFT peer and original rank disagree on completed-step counters")
-+        if flags is not None and flags != metadata['data_flags']:
-+            raise ValueError("TFT donors disagree on data-iterator flags")
-+        flags = metadata['data_flags']
-+        stages = []
-+        for (index, leaf), (remote_index, state) in zip(training.domains[domain][2], metadata['leaves'], strict=True):
-+            if index != remote_index:
-+                raise ValueError("TFT peer returned a different optimizer leaf")
-+            stages.append((leaf, stage_leaf(leaf, training.names, state)))
++        stages = [
++            (leaf, stage_leaf(leaf, training.names, metadata['leaves'][index]))
++            for index, leaf in training.domains[domain][2]
++        ]
 +        grouped.append((source, stages))
 +
 +    updates = []
@@ -1043,8 +822,6 @@ index 000000000..2634035ac
 +    for leaf, stage, tensors in updates:
 +        apply_leaf(leaf, stage, tensors)
 +    torch.npu.synchronize()
-+    args = get_args()
-+    args.do_train, args.do_valid, args.do_test = flags
 +    training.received = progress
 +    training.step, training.pending, training.damaged = step, None, False
 +
@@ -1062,8 +839,6 @@ index 000000000..2634035ac
 +def recv_ckpt_from_peer(source):
 +    size = torch.empty(1, dtype=torch.long, device='npu')
 +    dist.recv(size, src=source, group=get_repair_group())
-+    if size.item() <= 0:
-+        raise ValueError("TFT peer sent an empty memory checkpoint")
 +    payload = torch.empty(size.item(), dtype=torch.uint8, device='npu')
 +    dist.recv(payload, src=source, group=get_repair_group())
 +    buffer = io.BytesIO(payload.cpu().numpy().tobytes())
@@ -1094,8 +869,6 @@ index 000000000..2634035ac
 +        loss = torch.empty(1, dtype=torch.float32, device='npu')
 +        dist.recv(loss, src=source, group=get_repair_group())
 +        loss = loss.item()
-+    elif size.item() != -1:
-+        raise ValueError("TFT peer log loss frame is invalid")
 +    stats = []
 +    for _ in range(2):
 +        value = torch.empty(1, dtype=torch.float32)
@@ -1107,8 +880,8 @@ index 000000000..2634035ac
 +def load_ckpt_repair(training):
 +    """Load the native checkpoint only for TFT's two disk actions."""
 +    args = get_args()
-+    if not args.load:
-+        raise ValueError("TFT requested disk recovery without --load")
++    if args.no_load_optim or args.no_load_rng:
++        raise ValueError("TFT disk recovery requires optimizer and RNG state")
 +    training.damaged = True
 +    for field in training.counters:
 +        setattr(args, field, 0)
@@ -1125,10 +898,10 @@ index 000000000..2634035ac
 +    tft_report_load_ckpt_step(step)
 diff --git a/megatron/training/high_availability/tft_replica_group.py b/megatron/training/high_availability/tft_replica_group.py
 new file mode 100644
-index 000000000..fe2829ebe
+index 000000000..ba2ce7d3b
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_replica_group.py
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,76 @@
 +# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 +# Modifications Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
 +# Modification description：Modify the compose of processor group DP-CP-EP for MindIo.
@@ -1158,10 +931,7 @@ index 000000000..fe2829ebe
 +
 +
 +def get_repair_group(use_gloo: bool = False):
-+    global REPAIR_GROUP, REPAIR_GROUP_GLOO
-+    if use_gloo:
-+        return REPAIR_GROUP_GLOO
-+    return REPAIR_GROUP
++    return REPAIR_GROUP_GLOO if use_gloo else REPAIR_GROUP
 +
 +
 +def destroy_repair_group():
@@ -1207,15 +977,13 @@ index 000000000..fe2829ebe
 +        result.append((members, width, bound))
 +    if sorted(index for _, _, domain_leaves in result for index, _ in domain_leaves) != list(range(len(leaves))):
 +        raise RuntimeError("TFT could not bind every native optimizer leaf to a unique domain")
-+    if any(leaf.grad_scaler is not None for leaf in leaves):
-+        raise RuntimeError("TFT native BF16 repair requires the unity loss scale")
 +    return result
 diff --git a/megatron/training/high_availability/tft_rollback.py b/megatron/training/high_availability/tft_rollback.py
 new file mode 100644
-index 000000000..6bdbaee27
+index 000000000..dfa723e1e
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_rollback.py
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,91 @@
 +# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
 +"""Port the official rollback order to native DDP and its iterator builder."""
 +
@@ -1247,11 +1015,9 @@ index 000000000..6bdbaee27
 +        step = training.received['step']
 +    training.require_state(step)
 +    progress = training.received or training.original_rank_progress(step)
-+    if progress['step'] != step:
-+        raise ValueError("TFT rollback progress differs from the selected step")
 +    training.damaged = True
-+    for key, value in progress['counters'].items():
-+        setattr(args, key, value)
++    for key in training.counters:
++        setattr(args, key, progress['counters'][key])
 +    args.iteration = args.curr_iteration = step
 +    args.num_floating_point_operations_so_far = progress['flops']
 +    training.scheduler.num_steps = 0
@@ -1311,10 +1077,10 @@ index 000000000..6bdbaee27
 +    rerun.state = RerunState.NOT_RUNNING_YET
 diff --git a/megatron/training/high_availability/tft_stop_clean.py b/megatron/training/high_availability/tft_stop_clean.py
 new file mode 100644
-index 000000000..c71f1c677
+index 000000000..bbcae9dc8
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_stop_clean.py
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,87 @@
 +# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 +# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
 +
@@ -1375,41 +1141,27 @@ index 000000000..c71f1c677
 +
 +
 +def model_update_npu_tensor_to_safe(models):
-+    from torch_npu.npu._recovery import update_npu_tensor_to_safe as update_tensor_to_safe
++    from torch_npu.npu._recovery import (
++        update_npu_tensor_to_safe as update_tensor_to_safe,
++    )
 +
 +    for _, tensor in model_tensors(models):
 +        if tensor.device.type == 'npu':
 +            update_tensor_to_safe(tensor)
 +    for model in models:
-+        for buffer in model.buffers:
++        for buffer in model.buffers + model.expert_parallel_buffers:
 +            for bucket in buffer.buckets:
-+                if bucket.param_data is not None:
-+                    update_tensor_to_safe(bucket.param_data)
-+                if bucket.grad_data is not None:
-+                    update_tensor_to_safe(bucket.grad_data)
-+        for buffer in model.expert_parallel_buffers:
-+            for bucket in buffer.buckets:
-+                if bucket.param_data is not None:
-+                    update_tensor_to_safe(bucket.param_data)
-+                if bucket.grad_data is not None:
-+                    update_tensor_to_safe(bucket.grad_data)
++                for tensor in (bucket.param_data, bucket.grad_data):
++                    if tensor is not None:
++                        update_tensor_to_safe(tensor)
 +
 +
 +def unset_gather_handle(models):
 +    for model in models:
-+        for bucket_group in model.bucket_groups:
++        for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
 +            bucket_group.grad_reduce_handle = None
 +            bucket_group.param_gather_handle = None
 +            bucket_group.param_gather_dispatched = False
-+            if bucket_group.next_param_gather_bucket_group:
-+                bucket_group.next_param_gather_bucket_group.param_gather_handle = None
-+
-+        for bucket_group in model.expert_parallel_bucket_groups:
-+            bucket_group.grad_reduce_handle = None
-+            bucket_group.param_gather_handle = None
-+            bucket_group.param_gather_dispatched = False
-+            if bucket_group.next_param_gather_bucket_group:
-+                bucket_group.next_param_gather_bucket_group.param_gather_handle = None
 +
 +
 +def torch_sync():
@@ -1418,10 +1170,10 @@ index 000000000..c71f1c677
 +    ttp_logger.debug(f"[Pause] rank: {rank} finish synchronize")
 diff --git a/megatron/training/high_availability/tft_tensor_recovery.py b/megatron/training/high_availability/tft_tensor_recovery.py
 new file mode 100644
-index 000000000..d9d1fe9aa
+index 000000000..b99987563
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_tensor_recovery.py
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,64 @@
 +# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 +"""The official optimizer safe-storage traversal adapted to native DistOpt."""
 +
@@ -1476,10 +1228,7 @@ index 000000000..d9d1fe9aa
 +    """Restore the original rank's completed-step persistent tensor values."""
 +    from megatron.core.utils import unwrap_model
 +
-+    tensors = dict(model_tensors(models))
-+    if tensors.keys() != values.keys():
-+        raise ValueError("TFT saved different native model-buffer ownership")
-+    for key, target in tensors.items():
++    for key, target in model_tensors(models):
 +        source = values[key]
 +        if target.shape != source.shape or target.dtype != source.dtype:
 +            raise ValueError(f"TFT model buffer layout differs for {key}")
@@ -1491,10 +1240,10 @@ index 000000000..d9d1fe9aa
 +                clear()
 diff --git a/megatron/training/high_availability/tft_train_initialize.py b/megatron/training/high_availability/tft_train_initialize.py
 new file mode 100644
-index 000000000..02eb54be6
+index 000000000..8e633fda9
 --- /dev/null
 +++ b/megatron/training/high_availability/tft_train_initialize.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,192 @@
 +# Copyright (c) Huawei Technologies Co., Ltd. 2024. All rights reserved.
 +"""Port the official TFT bootstrap, callback registration and training wrapper."""
 +
@@ -1536,8 +1285,6 @@ index 000000000..02eb54be6
 +        processor_ip = ttp_ip
 +    port = 8000
 +
-+    if os.getenv('MINDIO_FOR_MINDSPORE', '').lower() in ('true', '1'):
-+        raise RuntimeError("Megatron TFT requires the PyTorch SDK mode")
 +    os.environ['TTP_STOP_CLEAN_BEFORE_DUMP'] = '1'
 +    start_controller = args.rank == 0 and os.getenv('MINDX_TASK_ID') is None
 +    if start_controller:
@@ -1652,8 +1399,8 @@ index 000000000..02eb54be6
 +            tft.tft_end_updating_os(self.step)
 +
 +    def begin(self, step):
-+        if self.pending is not None or self.damaged or step != self.step + 1:
-+            raise RuntimeError("TFT optimizer update is outside the completed step boundary")
++        if self.pending is not None or self.damaged:
++            raise RuntimeError("TFT cannot start an update while native state is incomplete")
 +        tft.tft_start_updating_os()
 +        self.pending = step
 +
@@ -1674,16 +1421,12 @@ index 000000000..02eb54be6
 +            raise ValueError(f"TFT action requires valid native state at completed step {step}")
 +
 +    def original_rank_progress(self, step):
-+        if self.progress is not None and self.progress['step'] == step:
-+            progress = self.progress
-+        elif self.recovery is not None:
-+            progress = self.recovery.rank_progress(get_args().rank, step)
-+        else:
-+            raise ValueError(f"TFT has no original-rank progress at step {step}")
-+        if progress is None or (progress['rank'], progress['step']) != (get_args().rank, step):
-+            raise ValueError("TFT recovery progress belongs to a different rank or step")
-+        if set(progress['counters']) != set(self.counters):
-+            raise ValueError("TFT requires the completed step's sample counters")
++        rank = get_args().rank
++        progress = self.progress
++        if progress is None or progress['step'] != step:
++            progress = self.recovery.rank_progress(rank, step) if self.recovery is not None else None
++        if progress is None or (progress['rank'], progress['step']) != (rank, step):
++            raise ValueError(f"TFT needs completed-step progress for rank {rank} at step {step}")
 +        return progress
 +
 +

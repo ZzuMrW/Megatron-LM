@@ -1,7 +1,5 @@
 """Native 0.18.0 shard access for the ported TFT callbacks."""
 
-import math
-
 import torch
 
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
@@ -32,11 +30,7 @@ def export_leaf(leaf, names):
         _, main = _master(leaf, parameter)
         native = leaf.optimizer.state.get(main, {})
         values = leaf._get_main_param_and_optimizer_states(parameter)
-        if set(native) - {'exp_avg', 'exp_avg_sq', 'step'}:
-            raise ValueError("TFT supports native Adam state keys")
-        keys = tuple(key for key in ADAM_KEYS if key in values)
-        if keys not in (('param',), ADAM_KEYS):
-            raise ValueError("TFT found incomplete Adam moments")
+        keys = ADAM_KEYS if 'exp_avg' in values else ('param',)
         entries.append(
             (extent, tuple((key, values[key].shape, values[key].dtype) for key in keys), native.get('step'))
         )
@@ -48,7 +42,7 @@ def stage_leaf(leaf, names, metadata):
     """Check destination shard coordinates before any native state is modified."""
     groups = metadata['groups']
     for group, remote in zip(leaf.optimizer.param_groups, groups, strict=True):
-        if 'params' in remote or any(group[key] != remote[key] for key in param_group_identifier_keys):
+        if any(group[key] != remote[key] for key in param_group_identifier_keys):
             raise ValueError("TFT optimizer group identifiers differ")
     entries = []
     for (parameter, current), (extent, specs, step) in zip(
@@ -62,10 +56,6 @@ def stage_leaf(leaf, names, metadata):
             raise ValueError("TFT peer supplied invalid Adam state keys")
         if any(shape != main.shape or dtype != main.dtype for _, shape, dtype in specs):
             raise ValueError("TFT peer supplied an incompatible native tensor")
-        if step is not None:
-            number = step.item() if isinstance(step, torch.Tensor) and step.ndim == 0 else step
-            if not isinstance(number, (int, float)) or not math.isfinite(number) or number < 0:
-                raise ValueError("TFT peer supplied an invalid Adam step")
         entries.append((main, specs, step, group_index))
     return groups, entries
 

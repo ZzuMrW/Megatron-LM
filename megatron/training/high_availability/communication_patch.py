@@ -53,8 +53,6 @@ def new_group_wrapper(
 
     members = tuple(range(dist.get_world_size()) if ranks is None else sorted(ranks))
     actual_backend = backend or dist.get_backend()
-    if actual_backend not in ('hccl', 'gloo'):
-        raise ValueError(f"ARF cannot reconnect native backend {actual_backend}")
     kwargs = dict(
         ranks=list(members),
         timeout=timeout,
@@ -116,28 +114,8 @@ def replacement_model_setup(recovery):
             raise ValueError(f"ARF cannot defer startup reduction from {caller}")
         # Both tied-weight copies are restored from native DistOpt before training.
 
-    def reject(name):
-        def unexpected(*args, **kwargs):
-            raise ValueError(f"ARF startup collective {name} needs a customer-provided result")
-
-        return unexpected
-
-    guarded = {}
     dist.all_gather_object, dist.all_reduce = gather, reduce
     try:
-        for name in (
-            'barrier',
-            'broadcast',
-            'broadcast_object_list',
-            'all_gather',
-            'all_gather_into_tensor',
-            'reduce_scatter_tensor',
-            'all_to_all_single',
-        ):
-            guarded[name] = getattr(dist, name)
-            setattr(dist, name, reject(name))
         yield
     finally:
         dist.all_gather_object, dist.all_reduce = original_gather, original_reduce
-        for name, function in guarded.items():
-            setattr(dist, name, function)
