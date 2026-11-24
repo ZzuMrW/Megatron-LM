@@ -22,6 +22,42 @@ git apply "$TFT_PATCH"
 | [训练主循环](../../megatron/training/training.py)中的 `pretrain`、`train_step`、`train` 和数据加载入口 | 模型、优化器和 scheduler 就绪后，注册回调并用 TFT 装饰器调用原生 `train`。在顶层 `optimizer.step()` 之前上报开始更新，在设备同步、样本计数、scheduler 和该步进度就绪后上报完成并响应暂停。显式跳过的迭代也会推进数据游标，需要单独记录。回退后，训练使用重建的 iterator。 |
 | [分布式优化器](../../megatron/core/optimizer/distrib_optimizer.py)中的 `load_parameter_state_from_dp_zero` | legacy 加载分两次完成。optimizer 元数据先恢复 Adam 的标量 `step`，随后 DP-zero scatter 写回主权重和两个 moment。补丁在写回张量前保留已经恢复的 `step`，避免续训时权重与 Adam 更新次数不一致。这个改动只涉及 checkpoint 读取。 |
 
+### 适配文件目录树
+
+目录树以 Megatron 仓库根目录为起点，列出补丁涉及的 18 个代码文件和 `docs/ha` 下的交付文件。每行右侧标明文件的职责。
+
+```text
+Megatron-LM/
+├── megatron/
+│   ├── core/
+│   │   └── optimizer/
+│   │       └── distrib_optimizer.py             # legacy DP-zero 加载时保留已恢复的 Adam step
+│   └── training/
+│       ├── initialize.py                       # 在 world 建立前启动 TFT，识别 ARF 替换进程
+│       ├── training.py                         # 接入训练装饰器、整步提交和回退后的数据迭代器
+│       └── high_availability/
+│           ├── __init__.py                     # 向训练入口提供 TFT 启用、启动和步更新接口
+│           ├── high_availability_helper.py      # 解析 HIGH_AVAILABILITY 并设置各能力开关
+│           ├── initialize_patch.py             # 校验启动参数和 wheel，绑定 NPU 并启动 TFT
+│           ├── tft_train_initialize.py          # 启动 controller/processor，注册回调，保存完成步进度
+│           ├── tft_replica_group.py             # 绑定原生优化器域与副本，管理临时 HCCL/Gloo 修复组
+│           ├── native_distopt.py                # 读取原生分片区间，校验并写回 Adam 张量和元数据
+│           ├── tft_dump.py                      # 校验 TFT 保存分配，重组 legacy 文件并更新 tracker
+│           ├── tft_stop_clean.py                # 停设备、判断 UCE 等级、清理通信句柄并恢复设备
+│           ├── tft_tensor_recovery.py           # 遍历持久张量做安全标记，回退时恢复模型 buffer
+│           ├── tft_optimizer_data_repair.py     # 分派修复动作，点对点传输状态、分片和日志，或加载磁盘
+│           ├── tft_rollback.py                  # 恢复计数和 scheduler、同步模型参数、还原 RNG
+│           ├── dataloader_patch.py              # 按已消费位置重建 iterator，隔离建迭代器时的 RNG
+│           ├── communication_patch.py           # 记录原生组创建参数，处理替换进程的启动期通信
+│           ├── tft_arf_group_repair.py          # 按 TFT 通知重连 HCCL、重建 Gloo 并重绑句柄
+│           └── utils.py                        # 定义 clean 返回码和 UCE 等级等回调常量
+└── docs/
+    └── ha/
+        ├── tft-26.2-adaptation-guide-zh.md                     # 客户接入步骤、改动原因和使用边界
+        ├── tft-26.2-migration.md                              # 官方来源与目标函数的逐项对照
+        └── megatron-core-v0.18.0-mindspeed-llm-26.2-tft.patch  # 应用到 core_v0.18.0 的实现补丁
+```
+
 ## 二、准备运行环境与启动参数
 
 先确认客户的 Ascend 训练栈已能运行原生 BF16 Adam 和 Partial DistOpt。适配入口要求固定 world size、HCCL、可用的 Gloo 组、至少两个 optimizer 实例、`single` 或 `cyclic` sampler，并要求配置 `--save`。以下是两实例任务应并入现有启动命令的参数片段；模型、数据和并行参数沿用客户配置。
@@ -44,7 +80,7 @@ git apply "$TFT_PATCH"
 
 ## 三、逐函数迁移表
 
-表中 `core/HA` 和 `tasks/HA` 分别指官方 MindSpeed-LLM 默认树的 `mindspeed_llm/core/high_availability` 和 `mindspeed_llm/tasks/high_availability`。目标模块位于 Megatron 的 `megatron/training/high_availability`，训练入口和 legacy reader 的改动见第一节。合并客户分支时，可按“保留的行为”核对调用顺序，再按“为什么要改”定位依赖原优化器的部分。
+表中 `core/HA` 和 `tasks/HA` 分别指官方 MindSpeed-LLM 默认树的 `mindspeed_llm/core/high_availability` 和 `mindspeed_llm/tasks/high_availability`。目标模块位于 Megatron 的 `megatron/training/high_availability`，训练入口和 legacy reader 的改动见第一节。合并客户分支时，可按“保留的行为”核对调用顺序，再按“为什么要改”定位依赖原优化器的部分。[逐函数迁移表与接入边界](tft-26.2-migration.md)
 
 | 官方文件及函数 | 保留的行为 | 为什么要改，以及如何替换 | 目标位置 |
 | --- | --- | --- | --- |
@@ -97,3 +133,14 @@ clean 处理设备和存储的可用性。高等级 UCE 可能已经损坏张量
 | `rank_progress(rank, step)` | 当前进程没有指定步的小状态时，返回原逻辑 rank 在该完成步的 `rank`、`step`、`counters`、`flops`、`scheduler`、`rng`、`model_buffers`。其中 `counters` 包含 `consumed_train_samples`、`skipped_train_samples`、`consumed_valid_samples`。结构以 [TrainingState._progress](../../megatron/training/high_availability/tft_train_initialize.py) 为准。 | 同进程 UCE 可使用本地同一步的内存进度。原进程退出后，这份内存随之丢失；客户无法提供原 rank 状态时，内存修复无法继续，只能处理 TFT 正式下发的磁盘动作。 |
 
 这两个方法由客户已有的数据来源提供。补丁本身只在进程内保存完成步进度。若客户自定义模型在启动时还有其他依赖返回值的集合通信，需要先确认替换 rank 能从哪里取得相同结果。外部数据流或带持久 worker 的 DataLoader 同样需要原游标和 worker 状态；当前回退路径使用原生普通 DataLoader。
+
+## 五、客户接入时要确认的边界
+
+| 客户配置或需求 | 当前实现与接入条件 |
+| --- | --- |
+| 临终保存时 `EP>1`，或同一 legacy 文件的各域收到不同名单 | 回调拒绝发布。需要根据 TP/PP/EP 布局明确各域负责的文件以及合并规则。当前实现要求 `EP=1`，且同一文件的所有域使用相同的有序名单。 |
+| 临终文件必须是 `torch_dist`，或要求恢复每个故障 rank 的独立 RNG | TFT 26.2.0 的 `save_info` 只提供当前 rank 的域和选中成员。前者需要额外的全局保存规划，后者需要原 rank 的状态来源。当前临终文件使用 legacy 格式，只保存原生 reader 所需的单份 RNG 记录。 |
+| ARF 缺少原始参数组键或完成步进度 | 参数组键用于创建替换进程的原生优化器，缺失时替换进程初始化失败。优化器已建立但缺少原 rank 进度时，按 TFT 下发的磁盘动作恢复，磁盘加载需要全 world 参与。 |
+| ARF 使用自定义 launcher 或模型初始化流程 | 设备重新接入、相同逻辑 rank 和 rendezvous 由部署层负责。客户需提供 `optimizer_group_keys` 所需的启动交换结果，或依据固定拓扑证明可重建相同结果。其他依赖集合通信返回值的启动操作也要核对。 |
+| 使用外部数据流或持久 worker | 当前回退路径使用 Megatron 原生普通 DataLoader。扩展时需要客户提供可按原消费游标定位的数据源，并恢复对应的 worker 状态。 |
+| 客户 fork 的多节点训练与恢复 | 现场需确认 TorchNPU/HCCL/CANN、TFT wheel、启动器、拓扑和 checkpoint 格式的组合。临终读回、UCE、ARF 及性能目前均待客户环境验证。 |
