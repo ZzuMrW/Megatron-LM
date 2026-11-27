@@ -2297,6 +2297,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             ]
 
                 for model_param, tensors in recv_tensors.items():
+                    # The legacy file stores Adam's scalar step in optimizer metadata.
+                    if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                        step = self._get_main_param_and_optimizer_states(model_param).get("step")
+                        if step is not None:
+                            tensors["step"] = step
                     self._set_main_param_and_optimizer_states(model_param, tensors)
 
     @torch.no_grad()
